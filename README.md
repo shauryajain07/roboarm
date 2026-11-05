@@ -1,68 +1,52 @@
 # ROBOARM control for the Raspberry Pi
 
-This is the software for the ENGG1101 ROBOARM Contest 2026/27, "Domination of the Nine Squares". It runs on the team's Raspberry Pi and drives the course robot arm: five ST3215 servos, IDs 1–5. The servo commands are byte-for-byte the same as the course web controller's.
+This is the software for the ENGG1101 ROBOARM Contest 2026/27, "Domination of the Nine Squares". It works **alongside** the official workshop repo, [Kelvinchan324/STS3215-5DOF-Robot-Arm](https://github.com/Kelvinchan324/STS3215-5DOF-Robot-Arm):
 
-| File | What it does |
+- **Settings:** it reads that repo's `arm_settings.py` for the serial port, baud rate, servo IDs, zero positions, joint directions and angle limits.
+- **Saved scenarios:** they're official waypoint files in that repo's `motions/` folder, so `05_waypoint_sequence.py` can play them too.
+
+## Main app: `control_gui.py`
+
+| Tab | Purpose |
 |---|---|
-| `record.py` | **Pose recorder.** Run it on the Pi. It guides you through every pose and saves each one to `poses.json` as soon as you capture it. |
-| `game.py` | **Game-day GUI.** Pick a block type, then click a cell, and the arm picks the block up and places it. It also handles attacks, scoring, the attack tokens and the emergency stop on Space. |
-| `motion.py` | Moves the arm between recorded poses, with all joints arriving together, and runs the pick, place and attack sequences. |
-| `servo_bus.py` | The ST3215 serial driver. It sends one command for all five joints, and includes a simulated arm for practice. |
-| `poses.py` | The list of every pose needed, and the `poses.json` store. |
-| `strategy.py` | Suggests the next move: complete a line, block the opponent, then take the best open cell. Also suggests which opponent block to attack. |
+| **Arm panel** (always visible) | Live position in raw ticks and degrees, jog −/+, LIMP / HOLD, gripper presets, **E-STOP (Space or Esc)** |
+| **1 Setup poses** | Record STOW, SAFE, RACKWAIT and the gripper values **once**. Every scenario reuses them. |
+| **2 Record scenarios** | All 41 scenarios. Capture only the new poses (2 per scenario), then test and save. |
+| **3 Game** | Click a cell to place a block, which plays `pick_<block>` then `place_<block>_<cell>`. Also handles attacks (after the referee says OK), start lock, timer, score, tokens and suggested moves. |
 
-## Every case covered
+The 41 scenarios are:
+- `start` and `stow`
+- 3 picks
+- 9 attacks
+- 27 placements (every block in every cell)
 
-| Case | Count | Poses recorded |
-|---|---|---|
-| Global: stow, safe, rack_safe, gripper_open | — | 4 |
-| Pick the cube, the cylinder and the trophy | 3 | 6 (above + grip for each) |
-| Attack each of the 9 cells | 9 | 18 (front + hit for each) |
-| Place each block in each of the 9 cells | 27 | 54 (front + in for each) |
-| **Total** | | **82 poses** |
+See **[SCENARIO_CHECKLIST.md](SCENARIO_CHECKLIST.md)** for the recording walkthrough.
 
-Cell names are from **our** side of the rack:
+## Setup on the Pi
 
-```
-r1c1 r1c2 r1c3      top row
-r2c1 r2c2 r2c3
-r3c1 r3c2 r3c3      bottom row
-```
-
-## Pi setup (once)
+This assumes the workshop setup is already done: `~/robot-arm-lab/.venv` exists and the official repo is cloned.
 
 ```bash
-git clone <this repo's URL> roboarm && cd roboarm
-bash setup_pi.sh          # installs pyserial + tkinter and adds you to the 'dialout' group (reboot after)
-python3 record.py --mock  # practise the recorder with a simulated arm
-python3 -m unittest discover -s tests   # 15 tests: all 27 placements and 9 attacks on the simulated arm
+sudo apt install -y python3-tk
+source ~/robot-arm-lab/.venv/bin/activate
+cd ~/robot-arm-lab && gh repo clone shauryajain07/roboarm
+cd roboarm && python -m unittest discover -s tests     # 24 tests on a simulated arm
+python control_gui.py --mock                            # practise with no arm
+python control_gui.py                                   # real arm
 ```
 
-The serial port is detected automatically (`/dev/ttyUSB*`, `/dev/ttyACM*`). Set the port or baud rate in `arm_config.json` if you need to:
-- `115200` if the arm plugs into the Pi by USB through the controller board. This is the course web tool's default.
-- `1000000` if the Pi's UART is wired straight to the servo bus.
+The official repo is found automatically at `~/robot-arm-lab/STS3215-5DOF-Robot-Arm`. If it's somewhere else, set `ROBOARM_OFFICIAL=/path/to/it`. To override a setting just for our code, put it in `arm_config.json`.
 
-Read [RECORDING_GUIDE.md](RECORDING_GUIDE.md) before you record anything.
+## Files
 
-## Game day
+| File | Contents |
+|---|---|
+| `control_gui.py` | The GUI described above |
+| `scenarios.py` | The 41 scenario templates, `scenario_data.json`, and saving and loading official waypoint files |
+| `official.py` | Reads the official `arm_settings.py`, converts between raw ticks and angles, and writes waypoint files |
+| `motion.py` | Synchronised moves (all joints arrive together), joint limits, E-stop and grip detection |
+| `servo_bus.py` | The ST3215 serial driver (same bytes as the course tools), plus a simulated arm |
+| `strategy.py` | Suggests a placement (win, block, then the best open line) or an attack target |
+| `record.py`, `game.py` | Older terminal recorder and game GUI. `control_gui.py` replaces them. |
 
-```bash
-python3 record.py --status   # every case should show 9/9
-python3 game.py
-```
-
-1. **Preparation period:** put the arm in STOW and the blocks on their fixed plates (cube on Plate B left, cylinder on Plate A, trophy on Plate B right).
-2. **Start:** press **START** only on the referee's Start Signal. The GUI refuses to move before that.
-3. **Placing:** choose a block, then click a cell. The yellow cell is the suggested move. Right-click a cell to mark an opponent's block.
-4. **Attacking:** call "Attack" and wait for the referee's OK. Then tick *Referee authorised*, choose ATTACK, and click the cell.
-5. **Emergency stop:** **Space** or **Esc** cuts torque immediately. **RESET STOP** makes the arm hold its current position again.
-
-## Sharing poses with the team
-
-`poses.json` is committed to the repo. After a recording session, commit and push it so everyone has the same poses:
-
-```bash
-git add poses.json && git commit -m "poses: recorded <what>" && git push
-```
-
-Older versions are kept in `backups/`, which is not committed.
+`scenario_data.json` holds everything you've recorded. **Commit and push it** so the whole team has the same poses. Run `Rebuild all saved scenario files` on another Pi to regenerate the motion files from it.

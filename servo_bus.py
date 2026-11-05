@@ -115,15 +115,31 @@ def parse_status(buf: bytearray):
                 "params": bytes(pkt[5:-1]), "raw": bytes(pkt)}, buf[total:]
 
 
+def open_serial(port: str, baud: int, settle_s: float = 1.5):
+    """Open the port WITHOUT pulsing DTR/RTS. On ESP32 / Arduino-style driver boards
+    those lines are wired to reset, so a normal open reboots the board and the first
+    pings are lost while it boots. We hold them low, then wait and drop boot noise."""
+    import serial  # pyserial
+    ser = serial.Serial()
+    ser.port, ser.baudrate = port, baud
+    ser.timeout, ser.write_timeout = 0.01, 0.2
+    ser.dtr = False
+    ser.rts = False
+    ser.open()
+    if settle_s:
+        time.sleep(settle_s)
+        ser.reset_input_buffer()
+    return ser
+
+
 # ============================================================================
 class ServoBus:
     """One-request-in-flight serial client. Thread-safe."""
 
     def __init__(self, port: str, baud: int = 115200, write_replies: bool = True,
-                 transport=None):
+                 transport=None, settle_s: float = 1.5):
         if transport is None:
-            import serial  # pyserial
-            transport = serial.Serial(port, baud, timeout=0.01, write_timeout=0.2)
+            transport = open_serial(port, baud, settle_s)
         self.ser = transport
         self.write_replies = write_replies  # web tool waits for a status after every WRITE
         self._lock = threading.Lock()
