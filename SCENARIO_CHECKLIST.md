@@ -68,6 +68,31 @@ For each scenario, select it, capture the rows marked NEED CAPTURE, press **▶ 
 
 The GUI tracks progress ("x/41 saved"). **Tell Claude after each group**, and it will check the files.
 
+## Fluid motion
+
+Every scenario now plays **smoothly**:
+- **No stop-and-go.** The arm only stops at the precise spots (grab, block in the hole, hit, gripper changes) and glides through everything else.
+- **Faster:** about 40% quicker.
+- **Speed slider:** "playback speed ×" at the top changes the speed of every playback.
+
+**Want it to move exactly the way you do?** Record a **fluid take** of the scenario.
+
+1. Select the scenario and click **● Record fluid**. The arm goes to the scenario's start pose and goes LIMP after a 3-second countdown.
+2. Move the arm through the **whole scenario** by hand, at the speed you want. For a grab or release, click the **gripper buttons** on the left.
+3. Finish at SAFE and click **■ Stop**.
+4. It's cleaned automatically, and the log shows what changed:
+   - hand shake smoothed
+   - idle time at the start and end trimmed
+   - long pauses shortened, keeping time around grabs
+   - both ends snapped exactly to SAFE, so scenarios still chain together
+5. Click **▶ Test**. If you don't like it, click **Discard fluid (use waypoints)** or record it again.
+
+Fluid takes are saved in `trajectories/`. **Commit that folder** along with `scenario_data.json`.
+
+**After every push, Claude runs `clean.py` on your data.**
+- It fixes values outside the limits and missing lifts.
+- It writes `CLEANING_REPORT.md`, which lists anything you need to re-record.
+
 ## Tips
 
 - **Do the top corners first** (`r1c1`, `r1c3`). They're at the edge of the arm's reach.

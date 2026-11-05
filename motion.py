@@ -31,6 +31,9 @@ DEFAULT_CONFIG = {
     "attack_speed": 1500,    # single fast push (legacy record.py/game.py path)
     "max_speed": 3400,       # 'max' steps (attack HIT): above the ST3215's ~3000 ticks/s top speed = flat out
     "max_acc": 254,          # 'max' steps: highest acceleration (same as official MOVE_ACCELERATION)
+    "fluid_speed": 1100,     # peak ticks/s of smooth (fluid) playback; GUI slider scales it
+    "stream_hz": 40,         # how often fluid playback updates the servo targets
+    "stream_acc": 150,       # servo acceleration while streaming
     "acc": 30,
     "arrive_tolerance": 15,  # ticks (~1.3 deg)
     "move_timeout_s": 6.0,

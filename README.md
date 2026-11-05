@@ -42,6 +42,8 @@ The official repo is found automatically at `~/robot-arm-lab/STS3215-5DOF-Robot-
 | File | Contents |
 |---|---|
 | `control_gui.py` | The GUI described above |
+| `trajectory.py` | Fluid motion: records hand-guided takes, cleans them, turns waypoints into smooth curves, and streams them to the servos |
+| `clean.py` | Cleans pushed data (limits, missing lifts) and writes `CLEANING_REPORT.md` |
 | `scenarios.py` | The 41 scenario templates, `scenario_data.json`, and saving and loading official waypoint files |
 | `official.py` | Reads the official `arm_settings.py`, converts between raw ticks and angles, and writes waypoint files |
 | `motion.py` | Synchronised moves (all joints arrive together), joint limits, E-stop and grip detection |
@@ -49,4 +51,4 @@ The official repo is found automatically at `~/robot-arm-lab/STS3215-5DOF-Robot-
 | `strategy.py` | Suggests a placement (win, block, then the best open line) or an attack target |
 | `record.py`, `game.py` | Older terminal recorder and game GUI. `control_gui.py` replaces them. |
 
-`scenario_data.json` holds everything you've recorded. **Commit and push it** so the whole team has the same poses. Run `Rebuild all saved scenario files` on another Pi to regenerate the motion files from it.
+`scenario_data.json` (poses) and `trajectories/` (fluid takes) hold everything you've recorded. **Commit and push both** so the whole team has the same poses. Run `Rebuild all saved scenario files` on another Pi to regenerate the motion files from it.

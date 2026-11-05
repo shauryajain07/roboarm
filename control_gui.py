@@ -14,6 +14,7 @@ so 05_waypoint_sequence.py can play them too.
 from __future__ import annotations
 
 import argparse
+import json
 import queue
 import threading
 import time
@@ -24,6 +25,7 @@ from tkinter import messagebox, ttk
 import official
 import scenarios as sc
 import strategy
+import trajectory
 from motion import HERE, Arm, EStop, LimitError, load_config, open_bus
 from poses import ARM_JOINTS, BLOCK_POINTS, BLOCKS, CELLS, GRIPPER, JOINT_IDS, JOINT_NAMES, PoseStore
 from servo_bus import ServoError, mock_bus
@@ -35,10 +37,16 @@ ST = {"saved": "✓", "ready": "●", "todo": "○"}
 
 
 class App(tk.Tk):
-    def __init__(self, arm: Arm, data: sc.ScenarioData, folder: Path, settings=None):
+    def __init__(self, arm: Arm, data: sc.ScenarioData, folder: Path, settings=None, traj_folder=None):
         super().__init__()
         self.arm, self.data, self.folder, self.settings = arm, data, Path(folder), settings
+        self.traj_folder = Path(traj_folder or sc.TRAJ_DIR)
         self.conv = official.Conv(settings) if settings else None
+        self.names = ({settings.SERVO_IDS[n]: n for n in settings.JOINT_NAMES} if settings
+                      else trajectory.DEFAULT_NAMES)
+        self.rate = tk.DoubleVar(value=1.0)
+        self.rec_stop: threading.Event | None = None
+        self.recording = False
         self.title("ROBOARM control")
         self.q: queue.Queue = queue.Queue()
         arm.log = lambda m: self.q.put(("log", m))
@@ -72,6 +80,8 @@ class App(tk.Tk):
         tk.Button(top, text="RESET STOP", command=self.reset_stop).pack(side="right", padx=4)
         tk.Button(top, text="E-STOP  (Space)", bg="#b91c1c", fg="white", font=("Arial", 13, "bold"),
                   command=self.estop).pack(side="right")
+        tk.Scale(top, variable=self.rate, from_=0.5, to=2.0, resolution=0.1, orient="horizontal",
+                 length=150, label="playback speed ×").pack(side="right", padx=12)
 
         body = tk.Frame(self)
         body.pack(fill="both", expand=True, padx=6)
@@ -180,6 +190,22 @@ class App(tk.Tk):
                               "(or jog) → HOLD → CAPTURE. When every row is ✓: Test, then Save."),
                  fg="#555", wraplength=560, justify="left").pack(anchor="w", pady=8)
 
+        ff = tk.LabelFrame(right, text="Fluid motion (optional): record the whole scenario by hand, at your speed")
+        ff.pack(fill="x", pady=4)
+        self.motion_lbl = tk.Label(ff, text="", font=("Arial", 10, "bold"))
+        self.motion_lbl.pack(anchor="w")
+        fb = tk.Frame(ff)
+        fb.pack(anchor="w", pady=2)
+        self.rec_btn = tk.Button(fb, text="● Record fluid", bg="#fecaca", font=("Arial", 11, "bold"),
+                                 command=self.toggle_fluid)
+        self.rec_btn.pack(side="left", padx=2)
+        tk.Button(fb, text="Discard fluid (use waypoints)", command=self.discard_fluid).pack(side="left", padx=2)
+        tk.Label(ff, text=("The arm goes to the scenario's start pose and goes LIMP. Move it through the whole "
+                           "scenario (use the gripper buttons on the left for grab / release), end at SAFE, "
+                           "press ■ Stop. It is cleaned automatically: shake smoothed, pauses shortened, "
+                           "ends snapped to SAFE. Without a fluid take, the waypoints play as a smooth curve."),
+                 fg="#555", wraplength=560, justify="left").pack(anchor="w")
+
     def _build_game(self):
         f = self.tab_game
         top = tk.Frame(f)
@@ -248,6 +274,9 @@ class App(tk.Tk):
                                         + ("   ⛔ E-STOP" if self.arm.estop.is_set() else ""))
             elif kind == "conn":
                 self.status.config(text=f"⚠ servo read failed: {val}")
+            elif kind == "rec":
+                n, t = val
+                self.rec_btn.config(text=f"■ Stop  ({t:4.1f} s, {n} samples)")
             elif kind == "done":
                 self.running = False
                 if val:
@@ -296,10 +325,12 @@ class App(tk.Tk):
             self.log(f"reset failed: {e}")
 
     def jog(self, j, sign):
+        step = self.step.get()              # read on the Tk thread
+
         def f():
             p = self.arm.bus.read_position(j)
             self.arm.bus.set_torque(j, True)
-            self.arm.move_to({j: max(0, min(4095, p + sign * self.step.get()))}, speed=300,
+            self.arm.move_to({j: max(0, min(4095, p + sign * step))}, speed=300,
                              wait=(j != GRIPPER))
         self.run(f)
 
@@ -318,8 +349,13 @@ class App(tk.Tk):
         if g not in self.data.grips:
             return self.log(f"grip '{g}' not set yet (tab 1)")
         v = self.data.grips[g]
-        self.run(lambda: (self.arm.bus.set_torque(GRIPPER, True),
-                          self.arm.move_to({GRIPPER: v}, speed=500, ignore=(GRIPPER,))))
+        act = lambda: (self.arm.bus.set_torque(GRIPPER, True),
+                       self.arm.move_to({GRIPPER: v}, speed=500, ignore=(GRIPPER,)))
+        if self.recording:            # grab / release DURING a fluid recording
+            self.log(f"  gripper -> {g}")
+            threading.Thread(target=act, daemon=True).start()
+        else:
+            self.run(act)
 
     def goto(self, pose, label="pose"):
         if not pose:
@@ -386,7 +422,7 @@ class App(tk.Tk):
 
     # ================================================================ record tab
     def scen_status(self, name):
-        if (self.folder / f"{name}.json").exists():
+        if (self.folder / f"{name}.json").exists() or sc.fluid_path(name, self.traj_folder).exists():
             return "saved"
         return "todo" if self.data.missing(name) else "ready"
 
@@ -415,10 +451,25 @@ class App(tk.Tk):
         if not name:
             return
         self.scen_title.config(text=f"{name}   [{self.scen_status(name)}]")
+        fl = sc.fluid_path(name, self.traj_folder)
+        if fl.exists():
+            rep = json.loads(fl.read_text()).get("roboarm", {}).get("report", {})
+            self.motion_lbl.config(text=f"plays: ● FLUID TAKE ({rep.get('clean_duration_s', '?')} s, hand-recorded)",
+                                   fg="#15803d")
+        elif not self.data.missing(name):
+            self.motion_lbl.config(text="plays: smooth curve through the waypoints", fg="#1d4ed8")
+        else:
+            self.motion_lbl.config(text="plays: nothing yet (capture the poses or record a fluid take)", fg="#b91c1c")
+        if not self.recording:
+            self.rec_btn.config(text="● Record fluid")
         for i, r in enumerate(sc.template(name)):
             pose = self.data.row_pose(name, r)
-            src = {"shared": "shared (tab 1)", "capture": "CAPTURE here", "repeat": f"= {r.ref} above"}[r.kind]
-            if pose is not None:
+            src = {"shared": "shared (tab 1)", "capture": "CAPTURE here", "repeat": f"= {r.ref} above",
+                   "derived": "auto (short punch)"}[r.kind]
+            note = self.data.notes.get(f"{name}/{r.ref}")
+            if pose is not None and note:
+                st = "⚠ " + note
+            elif pose is not None:
                 st = "✓ " + (self.conv.angles_str(pose) if self.conv else " ".join(map(str, pose.values())))
             elif r.kind == "capture":
                 st = "NEED CAPTURE"
@@ -430,7 +481,8 @@ class App(tk.Tk):
                 st = f"capture {r.ref} first"
             self.rows.insert("", "end", iid=str(i), values=(r.ref, r.grip or "as is", src, st))
         todo = [str(i) for i, r in enumerate(sc.template(name))
-                if r.kind == "capture" and self.data.row_pose(name, r) is None]
+                if r.kind == "capture" and (self.data.row_pose(name, r) is None
+                                            or f"{name}/{r.ref}" in self.data.notes)]
         first = todo[0] if todo else "0"
         self.rows.selection_set(first)
         self.show_hint()
@@ -457,6 +509,7 @@ class App(tk.Tk):
         pose = self.arm.read_all()
         self._limit_warn(pose, f"{name}/{r.ref}")
         self.data.captures.setdefault(name, {})[r.ref] = pose
+        self.data.notes.pop(f"{name}/{r.ref}", None)       # re-recorded -> no longer provisional
         self.data.save()
         self.log(f"captured {name}/{r.ref}")
         if (self.folder / f"{name}.json").exists():
@@ -468,14 +521,87 @@ class App(tk.Tk):
         if r:
             self.goto(self.data.row_pose(name, r), f"{name}/{r.ref}")
 
+    def play_scenario(self, name, rate=1.0):
+        """Fluid playback: the recorded take if there is one, else the smooth waypoint curve.
+        Runs in a worker thread - `rate` is read from the slider on the Tk thread by the caller."""
+        tr, src = sc.fluid_for(self.data, name, self.arm.cfg, self.traj_folder)
+        if src == "recorded":
+            tr = trajectory.load(sc.fluid_path(name, self.traj_folder), self.names)
+        self.arm.log(f"  ▶ {name} ({src}, {tr.duration / rate:.1f} s at ×{rate:g})")
+        self.arm.torque(True)
+        last_g = int(round(tr.q[-1][GRIPPER]))
+        trajectory.play(self.arm, tr, rate=rate, hz=self.arm.cfg.get("stream_hz", 40),
+                        ignore_gripper=last_g in self.data.closed_values(), log=self.arm.log)
+        return True
+
     def play_selected(self):
         name = self.selected()
-        try:
-            pts = self.data.points(name)
-        except ValueError as e:
-            return self.log(str(e))
+        if not sc.playable(self.data, name, self.traj_folder):
+            return self.log(f"{name}: still need {', '.join(self.data.missing(name))}")
         self.log(f"TEST {name}" + (" - put the block in the jaws first!" if name.startswith("place") else ""))
-        self.run(self.play_points, pts, name, sc.speeds(name))
+        self.run(self.play_scenario, name, float(self.rate.get()))
+
+    # ---------------------------------------------------------------- fluid recording
+    def toggle_fluid(self):
+        if self.recording and self.rec_stop is not None:
+            self.rec_stop.set()
+            self.rec_btn.config(text="… cleaning")
+            return
+        name = self.selected()
+        if not name:
+            return
+        rows = sc.template(name)
+        start, end = self.data.row_pose(name, rows[0]), self.data.row_pose(name, rows[-1])
+        if start is None or end is None:
+            return self.log("set the shared poses and gripper values in tab 1 first")
+        if self.running:
+            return self.log("busy - wait for the current move to finish")
+        self.running = self.recording = True
+        self.rec_stop = threading.Event()
+        threading.Thread(target=self._record_fluid, args=(name, start, end), daemon=True).start()
+
+    def _record_fluid(self, name, start, end):
+        log = lambda m: self.q.put(("log", m))
+        done = None
+        try:
+            log(f"FLUID RECORD {name}: moving to its start pose")
+            self.arm.torque(True)
+            self.arm.move_to(start, speed=self.arm.cfg["slow_speed"], ignore=(GRIPPER,))
+            self.arm.torque(False, ARM_JOINTS)
+            log("  arm LIMP (gripper powered). Recording in 3…")
+            for k in (2, 1):
+                time.sleep(0.7)
+                log(f"  {k}…")
+            time.sleep(0.7)
+            log("  ● RECORDING - move through the scenario, end at SAFE, press ■ Stop")
+            raw = trajectory.record(self.arm.read_all, self.rec_stop, hz=25,
+                                    on_sample=lambda n, t: n % 5 == 0 and self.q.put(("rec", (n, t))))
+            cur = self.arm.read_all()
+            self.arm.bus.sync_write_positions({j: (cur[j], 150, 20) for j in JOINT_IDS})
+            self.arm.torque(True)
+            trajectory.save_raw(self.traj_folder / "raw" / f"{name}.json", raw)
+            tr, rep = trajectory.clean(raw, start, end)
+            trajectory.save(sc.fluid_path(name, self.traj_folder), tr, name,
+                            f"roboarm fluid take: {name}", self.names, extra={"report": rep})
+            log(f"  ✓ cleaned: {rep['raw_duration_s']} s recorded → {rep['clean_duration_s']} s "
+                f"(trimmed {rep['trimmed_s']} s, pauses -{rep['pauses_removed_s']} s, "
+                f"{rep['grip_events']} gripper events). Press ▶ Test.")
+        except EStop:
+            log("stopped by E-STOP - recording discarded")
+        except Exception as e:  # noqa: BLE001
+            log(f"ERROR: {e}")
+        finally:
+            self.recording = False
+            self.rec_stop = None
+            self.q.put(("done", done))
+
+    def discard_fluid(self):
+        name = self.selected()
+        p = sc.fluid_path(name, self.traj_folder)
+        if p.exists():
+            p.unlink()
+            self.log(f"discarded the fluid take for {name} - it will play its waypoints as a smooth curve")
+        self.refresh_all()
 
     def save_selected(self):
         name = self.selected()
@@ -502,7 +628,7 @@ class App(tk.Tk):
 
     # ================================================================ game tab
     def has(self, name):
-        return (self.folder / f"{name}.json").exists()
+        return sc.playable(self.data, name, self.traj_folder)
 
     def play_file(self, name, game=True, after=None):
         names = name if isinstance(name, list) else [name]
@@ -510,10 +636,11 @@ class App(tk.Tk):
         if missing:
             return self.log(f"not recorded yet: {', '.join(missing)}")
 
+        rate = float(self.rate.get())       # read on the Tk thread
+
         def f():
             for n in names:
-                path = self.folder / f"{n}.json"
-                self.play_points(sc.load_points(path), n, sc.load_speeds(path, n))
+                self.play_scenario(n, rate)
             return True
         self.run(f, after=after, game=game)
 

@@ -27,9 +27,23 @@ SHARED_HELP = {"STOW": "start pose, every part inside the Robot Area",
                "RACKWAIT": "facing the rack, just OUTSIDE the green zone"}
 
 
+PUNCH_TICKS = 200      # max joint travel of the full-speed part of an attack
+STOP_REFS = {"GRAB", "IN", "HIT", "PREHIT"}   # precision points: the arm comes to rest here
+
+
+def prehit(front: dict, hit: dict, punch: int = PUNCH_TICKS) -> dict:
+    """Point on the FRONT->HIT line, at most `punch` ticks (any arm joint) before HIT."""
+    arm = [j for j in front if j != GRIPPER]
+    d = max(abs(front[j] - hit[j]) for j in arm)
+    if d <= punch:
+        return dict(front)
+    r = punch / d
+    return {j: int(round(hit[j] + (front[j] - hit[j]) * r)) for j in front}
+
+
 @dataclass(frozen=True)
 class Row:
-    kind: str          # shared | capture | repeat
+    kind: str          # shared | capture | repeat | derived
     ref: str           # shared pose name, or capture label
     grip: str | None   # gripper override key, None = keep the pose's own gripper
     hint: str
@@ -55,6 +69,8 @@ def template(name: str) -> list[Row]:
         c = rest
         return [S("SAFE", "attack"), S("RACKWAIT", "attack"),
                 Row("capture", "FRONT", "attack", f"tip lined up with {c} ({cell_words(c)}), ~2 cm in front"),
+                Row("derived", "PREHIT", "attack", "automatic: just before HIT, so only the last "
+                    f"{PUNCH_TICKS} ticks are the fast punch"),
                 Row("capture", "HIT", "attack", "ONE push THROUGH the hole, not into the frame "
                     "(played at MAX speed; no hammering 3.3.4.13, no excessive force on the rack 4.4)",
                     speed="max"),
@@ -95,8 +111,10 @@ class ScenarioData:
         self.shared: dict[str, dict[int, int]] = {}
         self.grips: dict[str, int] = {}
         self.captures: dict[str, dict[str, dict[int, int]]] = {}
+        self.notes: dict[str, str] = {}       # "scenario/LABEL" -> note (e.g. provisional pose)
         if self.path.exists():
             d = json.loads(self.path.read_text())
+            self.notes = dict(d.get("notes", {}))
             ints = lambda p: {int(k): int(v) for k, v in p.items()}
             self.shared = {k: ints(v) for k, v in d.get("shared", {}).items()}
             self.grips = {k: int(v) for k, v in d.get("grips", {}).items()}
@@ -106,7 +124,8 @@ class ScenarioData:
         strs = lambda p: {str(k): v for k, v in sorted(p.items())}
         d = {"shared": {k: strs(v) for k, v in self.shared.items()},
              "grips": self.grips,
-             "captures": {s: {l: strs(p) for l, p in c.items()} for s, c in sorted(self.captures.items())}}
+             "captures": {s: {l: strs(p) for l, p in c.items()} for s, c in sorted(self.captures.items())},
+             "notes": self.notes}
         tmp = self.path.with_suffix(".tmp")
         tmp.write_text(json.dumps(d, indent=1))
         os.replace(tmp, self.path)
@@ -114,10 +133,13 @@ class ScenarioData:
     # -- building ------------------------------------------------------------
     def row_pose(self, name: str, row: Row):
         """Full 5-joint pose for one template row, or None if something is missing."""
+        caps = self.captures.get(name, {})
         if row.kind == "shared":
             base = self.shared.get(row.ref)
+        elif row.kind == "derived":
+            base = prehit(caps["FRONT"], caps["HIT"]) if "FRONT" in caps and "HIT" in caps else None
         else:
-            base = self.captures.get(name, {}).get(row.ref)
+            base = caps.get(row.ref)
         if base is None:
             return None
         p = dict(base)
@@ -134,7 +156,7 @@ class ScenarioData:
             gaps = []
             if r.kind == "shared" and r.ref not in self.shared:
                 gaps.append(f"shared {r.ref}")
-            if r.kind != "shared" and r.ref not in caps:
+            if r.kind in ("capture", "repeat") and r.ref not in caps:
                 gaps.append(f"capture {r.ref}")
             if r.grip and r.grip not in self.grips:
                 gaps.append(f"gripper '{r.grip}'")
@@ -165,6 +187,49 @@ def save_scenario(data: ScenarioData, name: str, folder: Path | None = None, set
                                    "rows": [f"{r.ref}" + (f" ({r.grip})" if r.grip else "") for r in rows],
                                    "point_speeds": [r.speed for r in rows]})
     return path
+
+
+# ============================================================================ fluid motion
+TRAJ_DIR = Path(__file__).resolve().parent / "trajectories"
+
+
+def fluid_path(name: str, folder: Path | None = None) -> Path:
+    return Path(folder or TRAJ_DIR) / f"{name}.json"
+
+
+def stop_flags(name: str, pts: list[dict]) -> list[bool]:
+    """Rest at: ends, precision rows (GRAB/IN/HIT/PREHIT), and around gripper changes."""
+    rows = template(name)
+    flags = []
+    for i, r in enumerate(rows):
+        g_change = ((i > 0 and pts[i][GRIPPER] != pts[i - 1][GRIPPER]) or
+                    (i + 1 < len(pts) and pts[i][GRIPPER] != pts[i + 1][GRIPPER]))
+        flags.append(i == 0 or i == len(rows) - 1 or r.ref in STOP_REFS or g_change)
+    return flags
+
+
+def fluid_from_waypoints(data: "ScenarioData", name: str, cfg: dict):
+    """Smooth curve through the scenario's waypoints (no stop-and-go)."""
+    import trajectory
+    pts = data.points(name)
+    sp = [cfg["max_speed"] if s == "max" else cfg.get("fluid_speed", 1100) for s in speeds(name)]
+    tr = trajectory.from_waypoints(pts, stop_flags(name, pts), sp)
+    tr.meta.update(scenario=name)
+    return tr
+
+
+def fluid_for(data: "ScenarioData", name: str, cfg: dict, folder: Path | None = None):
+    """The motion to play: a hand-recorded fluid take if one exists, else the
+    waypoints turned into a smooth curve. Returns (Traj, 'recorded'|'waypoints')."""
+    import trajectory
+    p = fluid_path(name, folder)
+    if p.exists():
+        return trajectory.load(p), "recorded"
+    return fluid_from_waypoints(data, name, cfg), "waypoints"
+
+
+def playable(data: "ScenarioData", name: str, folder: Path | None = None) -> bool:
+    return fluid_path(name, folder).exists() or not data.missing(name)
 
 
 def load_speeds(path, name: str | None = None) -> list[str]:

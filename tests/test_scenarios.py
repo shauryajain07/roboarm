@@ -69,7 +69,8 @@ class Templates(unittest.TestCase):
 
     def test_only_attack_hit_is_max_speed(self):
         sp = sc.speeds("attack_r2c3")
-        self.assertEqual(sp[3], "max")
+        hit = [r.ref for r in sc.template("attack_r2c3")].index("HIT")
+        self.assertEqual(sp[hit], "max")
         self.assertEqual(sp.count("max"), 1, "only FRONT -> HIT is fast")
         for n in ("pick_trophy", "place_cube_r1c1", "start", "stow"):
             self.assertNotIn("max", sc.speeds(n))
@@ -79,7 +80,8 @@ class Templates(unittest.TestCase):
         d = full_data(folder / "d.json")
         path = sc.save_scenario(d, "attack_r1c1", folder)
         self.assertEqual(sc.load_speeds(path), sc.speeds("attack_r1c1"))
-        self.assertEqual(sc.load_speeds(path, "attack_r1c1")[3], "max")
+        hit = [r.ref for r in sc.template("attack_r1c1")].index("HIT")
+        self.assertEqual(sc.load_speeds(path, "attack_r1c1")[hit], "max")
 
     def test_hit_packet_uses_max_speed_and_acceleration(self):
         from test_all_cases import make_arm

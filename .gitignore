@@ -4,3 +4,4 @@ backups/
 poses.json.tmp
 arm_config.json
 .DS_Store
+scenario_data.backup-*.json
