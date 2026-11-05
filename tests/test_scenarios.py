@@ -67,6 +67,31 @@ class Templates(unittest.TestCase):
         with self.assertRaises(ValueError):
             d.points("place_cube_r1c1")
 
+    def test_only_attack_hit_is_max_speed(self):
+        sp = sc.speeds("attack_r2c3")
+        self.assertEqual(sp[3], "max")
+        self.assertEqual(sp.count("max"), 1, "only FRONT -> HIT is fast")
+        for n in ("pick_trophy", "place_cube_r1c1", "start", "stow"):
+            self.assertNotIn("max", sc.speeds(n))
+
+    def test_speeds_saved_and_reloaded(self):
+        folder = Path(tempfile.mkdtemp())
+        d = full_data(folder / "d.json")
+        path = sc.save_scenario(d, "attack_r1c1", folder)
+        self.assertEqual(sc.load_speeds(path), sc.speeds("attack_r1c1"))
+        self.assertEqual(sc.load_speeds(path, "attack_r1c1")[3], "max")
+
+    def test_hit_packet_uses_max_speed_and_acceleration(self):
+        from test_all_cases import make_arm
+        from motion import DEFAULT_CONFIG
+        from poses import PoseStore
+        arm, mock, _ = make_arm(PoseStore(str(Path(tempfile.mkdtemp()) / "p.json")))
+        arm.move_to({1: 3000, 2: 2048}, speed=DEFAULT_CONFIG["max_speed"], acc=DEFAULT_CONFIG["max_acc"])
+        pkt = [p for p in mock.log if p[4] == 0x83][-1]     # last SYNC WRITE
+        # FF FF FE len 83 41 7 | id acc posL posH 0 0 spdL spdH | ...
+        sid, acc, spd = pkt[7], pkt[8], pkt[13] | (pkt[14] << 8)
+        self.assertEqual((sid, acc, spd), (1, 254, 3400))
+
     def test_data_roundtrip(self):
         p = Path(tempfile.mkdtemp()) / "d.json"
         full_data(p).save()

@@ -28,7 +28,9 @@ DEFAULT_CONFIG = {
     "write_replies": True,   # servos send a status after WRITE (web tool assumes yes)
     "speed": 700,            # ticks/s for the joint that has the furthest to go
     "slow_speed": 250,       # final 'in' / 'grip' approach
-    "attack_speed": 1500,    # single fast push
+    "attack_speed": 1500,    # single fast push (legacy record.py/game.py path)
+    "max_speed": 3400,       # 'max' steps (attack HIT): above the ST3215's ~3000 ticks/s top speed = flat out
+    "max_acc": 254,          # 'max' steps: highest acceleration (same as official MOVE_ACCELERATION)
     "acc": 30,
     "arrive_tolerance": 15,  # ticks (~1.3 deg)
     "move_timeout_s": 6.0,
@@ -205,19 +207,20 @@ class Arm:
                 raise LimitError(f"joint {j} target {v} outside limit {lo}-{hi}")
 
     # ------------------------------------------------------------------ moving
-    def move_to(self, target: dict, speed=None, wait=True, ignore=()):
+    def move_to(self, target: dict, speed=None, wait=True, ignore=(), acc=None):
         """Move all joints together so they ARRIVE at the same time."""
         self._guard()
         target = {int(j): int(v) for j, v in target.items()}
         self.check_limits(target)
         speed = speed or self.cfg["speed"]
+        acc = self.cfg["acc"] if acc is None else acc
         try:
             cur = self.read_all()
         except ServoTimeout:
             cur = dict(target)
         dist = {j: abs(target[j] - cur.get(j, target[j])) for j in target}
         far = max(dist.values()) or 1
-        cmd = {j: (target[j], max(30, int(speed * dist[j] / far)), self.cfg["acc"]) for j in target}
+        cmd = {j: (target[j], max(30, int(speed * dist[j] / far)), acc) for j in target}
         self.bus.sync_write_positions(cmd)
         if GRIPPER in target:
             self.gripper_goal = target[GRIPPER]

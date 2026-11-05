@@ -73,7 +73,9 @@ The GUI tracks progress ("x/41 saved"). **Tell Claude after each group**, and it
 - **Do the top corners first** (`r1c1`, `r1c3`). They're at the edge of the arm's reach.
 - **For a placement, put the block in the jaws first:** **grip open**, place the block, then **grip cube** (or the matching block).
 - **A placement's IN pose** should leave the block **sitting stable on its own** (rule 3.3.2.4).
-- **An attack's HIT is one push only.** Hammering is a violation (rule 3.3.4.13).
+- **An attack's HIT is one push only, and it plays at maximum speed and acceleration.**
+  - Aim it **through the hole**, never at the frame. Excessive force on the rack is a violation (rule 4.4), and so is hammering (rule 3.3.4.13).
+  - Before pressing Test, check the HIT pose slowly with **Go to selected**.
 - **⚠ outside the official ANGLE_LIMITS** in the log means playback will refuse that pose. Recapture it a little inside the limits.
 - **Commit `scenario_data.json`** after each session so the team shares the same poses:
   `git add scenario_data.json && git commit -m "scenarios: <group>" && git push`

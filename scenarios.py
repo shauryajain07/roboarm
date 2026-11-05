@@ -33,6 +33,7 @@ class Row:
     ref: str           # shared pose name, or capture label
     grip: str | None   # gripper override key, None = keep the pose's own gripper
     hint: str
+    speed: str = "normal"   # normal | max  (max = servo top speed + max acceleration)
 
 
 def template(name: str) -> list[Row]:
@@ -54,7 +55,9 @@ def template(name: str) -> list[Row]:
         c = rest
         return [S("SAFE", "attack"), S("RACKWAIT", "attack"),
                 Row("capture", "FRONT", "attack", f"tip lined up with {c} ({cell_words(c)}), ~2 cm in front"),
-                Row("capture", "HIT", "attack", "ONE push through the hole (no hammering, rule 3.3.4.13)"),
+                Row("capture", "HIT", "attack", "ONE push THROUGH the hole, not into the frame "
+                    "(played at MAX speed; no hammering 3.3.4.13, no excessive force on the rack 4.4)",
+                    speed="max"),
                 Row("repeat", "FRONT", "attack", "pull back out"),
                 S("RACKWAIT", "attack"), S("SAFE", "open")]
     if kind == "place":
@@ -72,6 +75,11 @@ def template(name: str) -> list[Row]:
 def all_scenarios() -> list[str]:
     return (["start", "stow"] + [f"pick_{b}" for b in BLOCKS] + [f"attack_{c}" for c in CELLS]
             + [f"place_{b}_{c}" for b in BLOCKS for c in CELLS])
+
+
+def speeds(name: str) -> list[str]:
+    """Speed class of each point of a scenario ('normal' or 'max'), same order as points()."""
+    return [r.speed for r in template(name)]
 
 
 def captures_needed(name: str) -> list[str]:
@@ -154,8 +162,25 @@ def save_scenario(data: ScenarioData, name: str, folder: Path | None = None, set
     rows = template(name)
     official.write_sequence(path, name, f"roboarm scenario: {name}", data.points(name), settings,
                             extra={"made_with": "roboarm control_gui",
-                                   "rows": [f"{r.ref}" + (f" ({r.grip})" if r.grip else "") for r in rows]})
+                                   "rows": [f"{r.ref}" + (f" ({r.grip})" if r.grip else "") for r in rows],
+                                   "point_speeds": [r.speed for r in rows]})
     return path
+
+
+def load_speeds(path, name: str | None = None) -> list[str]:
+    """Speed class per point of a saved file. Uses the scenario template when the file
+    still matches it, else the file's own point_speeds, else all 'normal'."""
+    d = json.loads(Path(path).read_text())
+    n = len(d.get("points", []))
+    name = name or d.get("name")
+    try:
+        sp = speeds(name)
+        if len(sp) == n:
+            return sp
+    except KeyError:
+        pass
+    sp = d.get("point_speeds")
+    return sp if isinstance(sp, list) and len(sp) == n else ["normal"] * n
 
 
 def load_points(path) -> list[dict[int, int]]:

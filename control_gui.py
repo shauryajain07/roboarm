@@ -331,12 +331,17 @@ class App(tk.Tk):
         self.log(f"-> {label}")
         self.run(f)
 
-    def play_points(self, pts, label):
+    def play_points(self, pts, label, speeds=None):
         closed = self.data.closed_values()
+        speeds = speeds or ["normal"] * len(pts)
+        cfg = self.arm.cfg
         self.arm.torque(True)
-        for i, p in enumerate(pts, 1):
-            self.arm.log(f"  {label} point {i}/{len(pts)}")
-            self.arm.move_to(p, ignore=(GRIPPER,) if p[GRIPPER] in closed else ())
+        for i, (p, sp) in enumerate(zip(pts, speeds), 1):
+            fast = sp == "max"
+            self.arm.log(f"  {label} point {i}/{len(pts)}" + ("  ⚡ MAX SPEED" if fast else ""))
+            self.arm.move_to(p, ignore=(GRIPPER,) if p[GRIPPER] in closed else (),
+                             speed=cfg["max_speed"] if fast else None,
+                             acc=cfg["max_acc"] if fast else None)
             if i < len(pts) and p[GRIPPER] != pts[i][GRIPPER]:
                 time.sleep(0.05)
         return True
@@ -470,7 +475,7 @@ class App(tk.Tk):
         except ValueError as e:
             return self.log(str(e))
         self.log(f"TEST {name}" + (" - put the block in the jaws first!" if name.startswith("place") else ""))
-        self.run(self.play_points, pts, name)
+        self.run(self.play_points, pts, name, sc.speeds(name))
 
     def save_selected(self):
         name = self.selected()
@@ -507,7 +512,8 @@ class App(tk.Tk):
 
         def f():
             for n in names:
-                self.play_points(sc.load_points(self.folder / f"{n}.json"), n)
+                path = self.folder / f"{n}.json"
+                self.play_points(sc.load_points(path), n, sc.load_speeds(path, n))
             return True
         self.run(f, after=after, game=game)
 
