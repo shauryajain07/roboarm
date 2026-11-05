@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+backups/
+poses.json.tmp
+arm_config.json
+.DS_Store

@@ -1,0 +1,21 @@
+{
+  "port": "auto",
+  "baud": 115200,
+  "write_replies": true,
+  "speed": 700,
+  "slow_speed": 250,
+  "attack_speed": 1500,
+  "acc": 30,
+  "arrive_tolerance": 15,
+  "move_timeout_s": 6.0,
+  "grip_squeeze": 40,
+  "grip_load_threshold": 120,
+  "gripper_close_direction": 1,
+  "joint_limits": {
+    "1": [0, 4095],
+    "2": [0, 4095],
+    "3": [0, 4095],
+    "4": [0, 4095],
+    "5": [0, 4095]
+  }
+}
