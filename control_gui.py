@@ -4,7 +4,9 @@
     python3 control_gui.py          # real arm (port/baud from the official arm_settings.py)
     python3 control_gui.py --mock   # simulated arm for practice
 
-Left : live joint readout, jog, LIMP / HOLD, gripper, E-STOP (Space or Esc).
+Left : a slider per joint (click = go there, drag = follow, wheel / arrows / hold ± = step;
+       the servo eases toward the slider at the chosen slider speed and never leaves the
+       official joint limits), live readout, LIMP / HOLD, gripper, E-STOP (Space or Esc).
 Tabs : 1 Setup poses   - STOW / SAFE / RACKWAIT + gripper values, recorded once
        2 Record        - the 41 scenarios; capture only what's new, test, save
        3 Game          - click a cell -> plays pick_<block> + place_<block>_<cell>
@@ -34,6 +36,11 @@ GAME_SECONDS = 180
 MAX_TOKENS = 3
 COL = {"us": "#2563eb", "them": "#dc2626", None: "#e5e7eb", "hint": "#facc15"}
 ST = {"saved": "✓", "ready": "●", "todo": "○"}
+# manual sliders: (ticks/s, acceleration). The servo eases toward the slider, so yanking it
+# never snaps the arm - pick "gentle" near the rack, "fast" for big repositioning.
+SLIDER_SPEEDS = {"gentle": (200, 15), "normal": (450, 35), "fast": (900, 80)}
+SLIDER_HZ = 20          # max rate slider targets are sent to the servos
+TOUCH_HOLD_S = 1.5      # after you touch a slider it stops following the live reading this long
 
 
 class App(tk.Tk):
@@ -63,10 +70,20 @@ class App(tk.Tk):
         self.started, self.t0 = False, None
 
         self.step = tk.IntVar(value=20)
+        # manual slider state: pending targets are picked up by the _stream thread
+        self.slider_speed = tk.StringVar(value="normal")
+        self._spd = SLIDER_SPEEDS["normal"]          # plain copy, read by the worker thread
+        self.slider_speed.trace_add("write", lambda *_: setattr(
+            self, "_spd", SLIDER_SPEEDS[self.slider_speed.get()]))
+        self.goal: dict[int, int] = {}
+        self.goal_lock = threading.Lock()
+        self.touched: dict[int, float] = {}
+        self._grab: dict[int, float | None] = {}
         self._build()
         for k in ("<space>", "<Escape>"):
             self.bind_all(k, lambda e: self.estop())
         threading.Thread(target=self._poll, daemon=True).start()
+        threading.Thread(target=self._stream, daemon=True).start()
         self.after(60, self._pump)
         self.refresh_all()
         self.protocol("WM_DELETE_WINDOW", self._close)
@@ -99,31 +116,69 @@ class App(tk.Tk):
         self.logbox = tk.Text(self, height=7, font=("Courier", 10))
         self.logbox.pack(fill="x", padx=6, pady=4)
 
+    def _limits(self, j):
+        lo, hi = self.arm.cfg["joint_limits"].get(str(j), (0, 4095))
+        return int(lo), int(hi)
+
     def _build_joints(self, parent):
-        f = tk.LabelFrame(parent, text="Arm")
+        f = tk.LabelFrame(parent, text="Arm - drag a slider to move that joint")
         f.pack(side="left", fill="y")
-        self.jlbl = {}
+        self.jlbl, self.sliders, self.svar = {}, {}, {}
         for j in JOINT_IDS:
-            tk.Label(f, text=f"{j} {JOINT_NAMES[j]}", width=9, anchor="w").grid(row=j, column=0)
-            tk.Button(f, text="−", width=2, command=lambda j=j: self.jog(j, -1)).grid(row=j, column=1)
-            self.jlbl[j] = tk.Label(f, text="----", width=13, font=("Courier", 11))
-            self.jlbl[j].grid(row=j, column=2)
-            tk.Button(f, text="+", width=2, command=lambda j=j: self.jog(j, 1)).grid(row=j, column=3)
+            lo, hi = self._limits(j)
+            r = 2 * j
+            tk.Label(f, text=f"{j} {JOINT_NAMES[j]}", width=8, anchor="w",
+                     font=("Arial", 10, "bold")).grid(row=r, column=0, rowspan=2, sticky="w")
+            # hold − / + down to keep moving
+            tk.Button(f, text="−", width=2, font=("Arial", 12, "bold"), repeatdelay=350, repeatinterval=90,
+                      command=lambda j=j: self.nudge(j, -1)).grid(row=r, column=1, rowspan=2)
+            self.svar[j] = tk.IntVar(value=(lo + hi) // 2)
+            s = tk.Scale(f, variable=self.svar[j], from_=lo, to=hi, orient="horizontal", length=240,
+                         showvalue=False, sliderlength=28, width=20, takefocus=True,
+                         highlightthickness=2, highlightcolor="#2563eb")
+            s.grid(row=r, column=2, padx=2, pady=(4, 0))
+            self._bind_slider(j, s)
+            self.sliders[j] = s
+            tk.Button(f, text="+", width=2, font=("Arial", 12, "bold"), repeatdelay=350, repeatinterval=90,
+                      command=lambda j=j: self.nudge(j, 1)).grid(row=r, column=3, rowspan=2)
+            self.jlbl[j] = tk.Label(f, text="----", font=("Courier", 10), anchor="w")
+            self.jlbl[j].grid(row=r + 1, column=2, sticky="w")
         sf = tk.Frame(f)
-        sf.grid(row=6, columnspan=4, pady=4)
-        tk.Label(sf, text="step").pack(side="left")
+        sf.grid(row=20, columnspan=4, pady=(6, 0))
+        tk.Label(sf, text="step (± / wheel / arrows)").pack(side="left")
         for v in (5, 20, 50, 150):
             tk.Radiobutton(sf, text=str(v), variable=self.step, value=v).pack(side="left")
+        vf = tk.Frame(f)
+        vf.grid(row=21, columnspan=4)
+        tk.Label(vf, text="slider speed").pack(side="left")
+        for k in SLIDER_SPEEDS:
+            tk.Radiobutton(vf, text=k, variable=self.slider_speed, value=k).pack(side="left")
+        tk.Label(f, text=("Click anywhere on a slider to send the joint there; drag the knob to follow.\n"
+                          "Mouse wheel / arrow keys = one step, Shift = 5 ticks."),
+                 fg="#555", justify="left").grid(row=22, columnspan=4, pady=(2, 4))
         tk.Button(f, text="LIMP arm (move by hand)", bg="#fde68a",
-                  command=self.limp).grid(row=7, columnspan=4, sticky="ew", pady=2)
-        tk.Button(f, text="HOLD here", bg="#bbf7d0", command=self.hold).grid(row=8, columnspan=4, sticky="ew")
-        tk.Label(f, text="Gripper", font=("Arial", 10, "bold")).grid(row=9, columnspan=4, pady=(8, 0))
+                  command=self.limp).grid(row=23, columnspan=4, sticky="ew", pady=2)
+        tk.Button(f, text="HOLD here", bg="#bbf7d0", command=self.hold).grid(row=24, columnspan=4, sticky="ew")
+        tk.Label(f, text="Gripper", font=("Arial", 10, "bold")).grid(row=25, columnspan=4, pady=(8, 0))
         gf = tk.Frame(f)
-        gf.grid(row=10, columnspan=4)
+        gf.grid(row=26, columnspan=4)
         for g in sc.GRIPS:
-            tk.Button(gf, text=g, width=7, command=lambda g=g: self.apply_grip(g)).pack(side="top")
-        tk.Label(f, text="LIMP keeps the gripper\npowered so a held\nblock won't drop.",
-                 fg="#555", justify="left").grid(row=11, columnspan=4, pady=6)
+            tk.Button(gf, text=g, width=7, command=lambda g=g: self.apply_grip(g)).pack(side="left")
+        tk.Label(f, text="LIMP keeps the gripper powered so a held block won't drop.",
+                 fg="#555", justify="left").grid(row=27, columnspan=4, pady=6)
+
+    def _bind_slider(self, j, s):
+        """Replace Tk's default Scale mouse handling (click on the trough = creep 1 tick at a
+        time) with: click = jump there, drag the knob = follow without jumping."""
+        s.bind("<Button-1>", lambda e: self._slide_press(j, e))
+        s.bind("<B1-Motion>", lambda e: self._slide_drag(j, e))
+        s.bind("<ButtonRelease-1>", lambda e: self._slide_release(j))
+        s.bind("<MouseWheel>", lambda e: self._step_key(j, 1 if e.delta > 0 else -1))   # mac / windows
+        s.bind("<Button-4>", lambda e: self._step_key(j, 1))                            # linux (Pi)
+        s.bind("<Button-5>", lambda e: self._step_key(j, -1))
+        for key, sign in (("Right", 1), ("Up", 1), ("Left", -1), ("Down", -1)):
+            s.bind(f"<{key}>", lambda e, d=sign: self._step_key(j, d))
+            s.bind(f"<Shift-{key}>", lambda e, d=sign: self._step_key(j, d, ticks=5))
 
     def _build_setup(self):
         f = self.tab_setup
@@ -267,9 +322,11 @@ class App(tk.Tk):
                 self.log(val)
             elif kind == "pos":
                 self.pos = val
+                now = time.monotonic()
                 for j, v in val.items():
-                    ang = f"{self.conv.angle(j, v):6.1f}°" if self.conv else ""
-                    self.jlbl[j].config(text=f"{v:4d} {ang}")
+                    if self._grab.get(j) is None and now - self.touched.get(j, 0) > TOUCH_HOLD_S:
+                        self.svar[j].set(v)          # idle slider follows the real arm
+                    self._show(j)
                 self.status.config(text=f"connected · {self.arm.cfg['port']} @ {self.arm.cfg['baud']}"
                                         + ("   ⛔ E-STOP" if self.arm.estop.is_set() else ""))
             elif kind == "conn":
@@ -324,15 +381,101 @@ class App(tk.Tk):
         except ServoError as e:
             self.log(f"reset failed: {e}")
 
-    def jog(self, j, sign):
-        step = self.step.get()              # read on the Tk thread
+    # ---------------------------------------------------------------- manual sliders
+    def _ang(self, j, v):
+        return f"{self.conv.angle(j, v):6.1f}°" if self.conv else ""
 
-        def f():
-            p = self.arm.bus.read_position(j)
-            self.arm.bus.set_torque(j, True)
-            self.arm.move_to({j: max(0, min(4095, p + sign * step))}, speed=300,
-                             wait=(j != GRIPPER))
-        self.run(f)
+    def _show(self, j):
+        v = self.pos.get(j)
+        now = f"{v:4d} {self._ang(j, v)}" if v is not None else "----"
+        g = self.svar[j].get()
+        tgt = (f"  → {g:4d} {self._ang(j, g).strip()}"
+               if time.monotonic() - self.touched.get(j, 0) <= TOUCH_HOLD_S and g != v else "")
+        self.jlbl[j].config(text=now + tgt)
+
+    def _can_slide(self, j):
+        if self.arm.estop.is_set():
+            self.log("E-STOP is latched - press RESET STOP first")
+            return False
+        if self.recording:
+            if j == GRIPPER:
+                return True
+            self.log("fluid recording - move the arm by hand (only the gripper slider works)")
+            return False
+        if self.running:
+            self.log("busy - wait for the current move to finish")
+            return False
+        return True
+
+    def set_goal(self, j, v):
+        """Point joint j's slider at v (clamped to its limits) and queue the move."""
+        lo, hi = self._limits(j)
+        v = int(round(max(lo, min(hi, v))))
+        self.svar[j].set(v)
+        self.touched[j] = time.monotonic()
+        with self.goal_lock:
+            self.goal[j] = v
+        self._show(j)
+
+    def _value_at(self, j, e):
+        s = self.sliders[j]
+        return float(s.tk.call(s._w, "get", e.x, e.y))
+
+    def _slide_press(self, j, e):
+        s = self.sliders[j]
+        s.focus_set()
+        if not self._can_slide(j):
+            self._grab[j] = None
+            return "break"
+        # grabbing the knob keeps its offset (no jump); clicking the trough jumps there
+        self._grab[j] = (self._value_at(j, e) - self.svar[j].get()
+                         if s.identify(e.x, e.y) == "slider" else 0.0)
+        self.set_goal(j, self._value_at(j, e) - self._grab[j])
+        return "break"
+
+    def _slide_drag(self, j, e):
+        if self._grab.get(j) is not None:
+            self.set_goal(j, self._value_at(j, e) - self._grab[j])
+        return "break"
+
+    def _slide_release(self, j):
+        self._grab[j] = None
+        return "break"
+
+    def _step_key(self, j, sign, ticks=None):
+        self.nudge(j, sign, ticks)
+        return "break"
+
+    def nudge(self, j, sign, ticks=None):
+        """± buttons, wheel, arrows: one step from where the joint is heading."""
+        if not self._can_slide(j):
+            return
+        recent = time.monotonic() - self.touched.get(j, 0) <= TOUCH_HOLD_S
+        base = self.svar[j].get() if recent or j not in self.pos else self.pos[j]
+        self.set_goal(j, base + sign * (ticks or self.step.get()))
+
+    def _stream(self):
+        """Send the newest slider target per joint at most SLIDER_HZ times a second, so a
+        fast drag never floods the bus and the servo always heads for where the slider is now."""
+        while self.alive:
+            time.sleep(1 / SLIDER_HZ)
+            with self.goal_lock:
+                pending, self.goal = self.goal, {}
+            if not pending or self.arm.estop.is_set():
+                continue
+            speed, acc = self._spd
+            for j, v in pending.items():
+                if self.recording and j != GRIPPER:
+                    continue
+                if self.running and not self.recording:
+                    continue
+                try:
+                    self.arm.bus.set_torque(j, True)
+                    self.arm.bus.write_position(j, v, speed, acc)
+                    if j == GRIPPER:
+                        self.arm.gripper_goal = v
+                except Exception as e:  # noqa: BLE001
+                    self.q.put(("log", f"slider move joint {j} failed: {e}"))
 
     def limp(self):
         self.run(lambda: self.arm.torque(False, ARM_JOINTS))
