@@ -16,6 +16,7 @@ import threading
 import time
 import tkinter as tk
 
+from gamepad import Gamepad
 from poses import GRIPPER, JOINT_NAMES
 
 PAD = 210            # canvas size, px
@@ -98,6 +99,12 @@ class DrivePanel:
         self.blocked: set[int] = set()              # refused this gesture (E-STOP / busy / recording)
         self.target: dict[int, float] = {}
 
+        self.pad_lbl = tk.Label(parent, text="🎮 looking for a controller…", font=("Arial", 11, "bold"),
+                                fg="#1d4ed8")
+        self.pad_lbl.pack(anchor="w", pady=(6, 0))
+        tk.Label(parent, text=("Controller: sticks as below · R2/L2 close/open · R1 grab · L1 open · "
+                               "○ E-STOP · Options reset · △ HOLD · ✕ CAPTURE · hold □ precise"),
+                 fg="#555", wraplength=640, justify="left").pack(anchor="w")
         tk.Label(parent, text=("Push a stick: the further you push, the faster that joint moves. "
                                "Let go: it stops. Mouse = one stick, keyboard = the other."),
                  font=("Arial", 11, "bold"), wraplength=640, justify="left").pack(anchor="w", pady=(6, 2))
@@ -131,6 +138,8 @@ class DrivePanel:
         for j, v in self.flip.items():
             tk.Checkbutton(ff, text=JOINT_NAMES[j], variable=v, command=self._save_flip).pack(side="left")
 
+        self.pad = Gamepad(on_button=self._pad_button,
+                           on_status=lambda t: app.q.put(("pad_status", t)))
         app.bind_all("<KeyPress>", self._key_down, add="+")
         app.bind_all("<KeyRelease>", self._key_up, add="+")
         app.after(int(TICK_S * 1000), self._tick)
@@ -166,6 +175,22 @@ class DrivePanel:
                 self.app.after_cancel(t)
             self.held[k] = self.app.after(40, lambda k=k: self.held.pop(k, None))
 
+    def _pad_button(self, name):
+        """Controller thread. E-STOP goes straight out - no waiting for the GUI loop."""
+        if name == "circle":
+            self.app.estop()
+        else:
+            self.app.q.put(("pad_btn", name))
+
+    def pad_button(self, name):
+        """GUI thread: the controller's action buttons."""
+        app = self.app
+        act = {"options": app.reset_stop, "triangle": app.hold, "cross": app.capture,
+               "r1": lambda: app.apply_grip(app.grab_grip()), "l1": lambda: app.apply_grip("open")}.get(name)
+        if act:
+            app.log(f"🎮 {name}")
+            act()
+
     def _save_flip(self):
         self.app.data.joy_flip = [j for j, v in self.flip.items() if v.get()]
         self.app.data.save()
@@ -188,6 +213,10 @@ class DrivePanel:
             for k in self.held:
                 j, s = KEYS[k]
                 vel[j] = vel.get(j, 0.0) + s
+        axes, _ = self.pad.state.snapshot()           # controller: same layout as the pads
+        for j, a in ((1, "lx"), (2, "ly"), (4, "rx"), (3, "ry")):
+            if curve(axes[a]):
+                vel[j] = vel.get(j, 0.0) + curve(axes[a])
         out = {}
         for j, v in vel.items():
             v = max(-1.0, min(1.0, v)) * (-1 if self.flip[j].get() else 1)
@@ -197,14 +226,17 @@ class DrivePanel:
 
     def _step(self):
         app = self.app
-        slow = self.precise.get() or self.shift
+        axes, pad_held = self.pad.state.snapshot()
+        slow = self.precise.get() or self.shift or "square" in pad_held
         scale = self.vmax.get() * (0.25 if slow else 1.0)
         moving = {j: v * scale for j, v in self._speeds().items()}
-        if self.grip_dir:
+        trig = axes["r2"] - axes["l2"]                 # analog: squeeze harder = faster
+        grip = self.grip_dir or (trig if abs(trig) > 0.08 else 0)
+        if grip:
             g = app.data.grips
             closes_up = not (g.get("open") is not None and app.data.closed_values()
                              and max(app.data.closed_values()) < g["open"])
-            moving[GRIPPER] = (self.grip_dir * (1 if closes_up else -1)
+            moving[GRIPPER] = (grip * (1 if closes_up else -1)
                                * GRIP_SPEED * (0.5 if slow else 1.0))
         if app.arm.estop.is_set():
             moving = {}

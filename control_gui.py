@@ -375,6 +375,11 @@ class App(tk.Tk):
                 for j, v in val.items():
                     if j not in self.drive.active:
                         self.set_goal(j, v)
+            elif kind == "pad_btn":
+                self.drive.pad_button(val)
+            elif kind == "pad_status":
+                self.drive.pad_lbl.config(text=val)
+                self.log(val)
             elif kind == "conn":
                 self.status.config(text=f"⚠ servo read failed: {val}")
             elif kind == "rec":
@@ -415,6 +420,7 @@ class App(tk.Tk):
 
     def _close(self):
         self.alive = False
+        self.drive.pad.stop()
         self.destroy()
 
     # ================================================================ arm controls
