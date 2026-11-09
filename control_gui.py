@@ -28,6 +28,7 @@ import official
 import scenarios as sc
 import strategy
 import trajectory
+from joystick import DrivePanel
 from motion import HERE, Arm, EStop, LimitError, load_config, open_bus
 from poses import ARM_JOINTS, BLOCK_POINTS, BLOCKS, CELLS, GRIPPER, JOINT_IDS, JOINT_NAMES, PoseStore
 from servo_bus import STRAIN_BITS, ServoError, describe_fault, mock_bus
@@ -81,6 +82,8 @@ class App(tk.Tk):
         self.goal_lock = threading.Lock()
         self.touched: dict[int, float] = {}
         self._grab: dict[int, float | None] = {}
+        self._live: dict[int, float] = {}      # joint -> last time the streamer powered/sent it
+        self._joy_speed = 0                    # joystick top speed while a stick is pushed
         self._rec_grab = "cube"
         self._rec_grip: int | None = None       # gripper value COMMANDED during a fluid recording
         self._sync_ok: bool | None = None       # SYNC READ supported? (None = not tried yet)
@@ -121,15 +124,17 @@ class App(tk.Tk):
         body = tk.Frame(self)
         body.pack(fill="both", expand=True, padx=6)
         self._build_joints(body)
-        nb = ttk.Notebook(body)
+        nb = self.nb = ttk.Notebook(body)
         nb.pack(side="left", fill="both", expand=True, padx=(8, 0))
-        self.tab_setup, self.tab_rec, self.tab_game = (ttk.Frame(nb) for _ in range(3))
+        self.tab_setup, self.tab_rec, self.tab_game, self.tab_drive = (ttk.Frame(nb) for _ in range(4))
         nb.add(self.tab_setup, text=" 1 Setup poses ")
         nb.add(self.tab_rec, text=" 2 Record scenarios ")
         nb.add(self.tab_game, text=" 3 Game ")
+        nb.add(self.tab_drive, text=" 4 Drive (joystick) ")
         self._build_setup()
         self._build_record()
         self._build_game()
+        self.drive = DrivePanel(self.tab_drive, self)
 
         self.logbox = tk.Text(self, height=7, font=("Courier", 10))
         self.logbox.pack(fill="x", padx=6, pady=4)
@@ -366,6 +371,10 @@ class App(tk.Tk):
                 self.status.config(text=f"connected · {self.arm.cfg['port']} @ {self.arm.cfg['baud']}"
                                         + ("   ⛔ E-STOP" if self.arm.estop.is_set() else "") + warn,
                                    fg="#b91c1c" if warn else "black")
+            elif kind == "stopat":             # joystick let go: hold where the joint really is
+                for j, v in val.items():
+                    if j not in self.drive.active:
+                        self.set_goal(j, v)
             elif kind == "conn":
                 self.status.config(text=f"⚠ servo read failed: {val}")
             elif kind == "rec":
@@ -410,6 +419,7 @@ class App(tk.Tk):
 
     # ================================================================ arm controls
     def estop(self):
+        self._live.clear()
         threading.Thread(target=self.arm.emergency_stop, daemon=True).start()
 
     def reset_stop(self):
@@ -520,23 +530,34 @@ class App(tk.Tk):
                 pending, self.goal = self.goal, {}
             if not pending or self.arm.estop.is_set():
                 continue
+            if self.running and not self.recording:
+                continue
+            if self.recording:                    # arm is hand-guided: only the gripper
+                pending = {j: v for j, v in pending.items() if j == GRIPPER}
+            if not pending:
+                continue
             speed, acc = self._spd
-            for j, v in pending.items():
-                if self.recording and j != GRIPPER:
-                    continue
-                if self.running and not self.recording:
-                    continue
-                try:
-                    self.arm.bus.set_torque(j, True)
-                    if j == GRIPPER:
-                        self._apply_grip_strength()
-                    self.arm.bus.write_position(j, v, speed, acc)
-                    if j == GRIPPER:
-                        self.arm.gripper_goal = v
-                except Exception as e:  # noqa: BLE001
-                    self.q.put(("log", f"slider move joint {j} failed: {e}"))
+            if self._joy_speed:                   # joystick: servo must keep up with the stick
+                speed, acc = max(speed, int(self._joy_speed * 1.5)), max(acc, 80)
+            now = time.monotonic()
+            try:
+                for j in pending:
+                    if now - self._live.get(j, -9.0) > 1.0:     # new gesture: make sure it's powered
+                        self.arm.bus.set_torque(j, True)
+                        if j == GRIPPER:
+                            self._apply_grip_strength()
+                # ONE packet, no reply, for every joint: replied writes cost ~11 ms each on
+                # this board, which would choke the joystick moving 4 joints at once
+                self.arm.bus.sync_write_positions({j: (v, speed, acc) for j, v in pending.items()})
+                for j in pending:
+                    self._live[j] = now
+                if GRIPPER in pending:
+                    self.arm.gripper_goal = pending[GRIPPER]
+            except Exception as e:  # noqa: BLE001
+                self.q.put(("log", f"slider move failed: {e}"))
 
     def limp(self):
+        self._live.clear()                      # next slider / stick move re-powers the joint
         self.run(lambda: self.arm.torque(False, ARM_JOINTS))
         self.log("arm joints 1-4 LIMP - support the arm and move it by hand, then HOLD")
 
@@ -811,6 +832,7 @@ class App(tk.Tk):
             self.arm.torque(True)
             self.arm.move_to(start, speed=self.arm.cfg["slow_speed"], ignore=(GRIPPER,))
             self.arm.torque(False, ARM_JOINTS)
+            self._live.clear()
             log("  arm LIMP (gripper powered). Recording in 3…")
             for k in (2, 1):
                 time.sleep(0.7)
