@@ -19,12 +19,15 @@ import tkinter as tk
 from gamepad import Gamepad
 from poses import GRIPPER, JOINT_NAMES
 
+NEVER = float("-inf")
+
 PAD = 210            # canvas size, px
 R = 80               # stick travel radius, px
 KNOB = 24
 DEAD = 0.12          # dead zone (fraction of full deflection)
 TICK_S = 0.025       # 40 Hz, same as the slider streamer
-GRIP_SPEED = 400     # ticks/s while OPEN / CLOSE is held
+GRIP_SPEED = 400     # ticks/s while OPEN / CLOSE (or L1 / R1) is held
+GRIP_SQUEEZE = 20    # max ticks past the point where the jaws stopped on something
 KEYS = {"a": (1, -1), "d": (1, 1), "w": (2, 1), "s": (2, -1),
         "j": (4, -1), "l": (4, 1), "i": (3, 1), "k": (3, -1)}
 
@@ -98,11 +101,12 @@ class DrivePanel:
         self.active: set[int] = set()               # joints moving last tick
         self.blocked: set[int] = set()              # refused this gesture (E-STOP / busy / recording)
         self.target: dict[int, float] = {}
+        self._grip_t0 = 0.0
 
         self.pad_lbl = tk.Label(parent, text="🎮 looking for a controller…", font=("Arial", 11, "bold"),
                                 fg="#1d4ed8")
         self.pad_lbl.pack(anchor="w", pady=(6, 0))
-        tk.Label(parent, text=("Controller: sticks as below · R1 gentle close · L1 open · hold L2 precise · "
+        tk.Label(parent, text=("Controller: sticks as below · hold R1 close · hold L1 open · hold L2 precise · "
                                "A B X Y presets (hold View + button to save) · D-pad ↓ E-STOP · D-pad ↑ reset · "
                                "L3 HOLD · R3 CAPTURE"),
                  fg="#555", wraplength=640, justify="left").pack(anchor="w")
@@ -207,8 +211,7 @@ class DrivePanel:
                 self._view_used = True
                 return app.save_preset(name)
             return app.go_preset(name)
-        act = {"dpad_up": app.reset_stop, "l3": app.hold, "r3": app.capture,
-               "r1": app.close_gently, "l1": app.open_full}.get(name)
+        act = {"dpad_up": app.reset_stop, "l3": app.hold, "r3": app.capture}.get(name)
         if act:
             app.log(f"🎮 {name.upper()}")
             act()
@@ -259,11 +262,12 @@ class DrivePanel:
 
     def _step(self):
         app = self.app
-        axes, _ = self.pad.state.snapshot()
+        axes, pad_held = self.pad.state.snapshot()
         slow = self.precise.get() or self.shift or axes["l2"] > 0.4      # hold L2 = precision
         scale = self.vmax.get() * (0.25 if slow else 1.0)
         moving = {j: v * scale for j, v in self._speeds().items()}
-        grip = self.grip_dir
+        # gripper: hold R1 = close step by step, hold L1 = open; let go = stop
+        grip = self.grip_dir or (("r1" in pad_held) - ("l1" in pad_held))
         if grip:
             g = app.data.grips
             closes_up = not (g.get("open") is not None and app.data.closed_values()
@@ -285,7 +289,7 @@ class DrivePanel:
             if j in self.target:
                 base = self.target[j]
             else:
-                recent = time.monotonic() - app.touched.get(j, 0) <= 1.5
+                recent = time.monotonic() - app.touched.get(j, NEVER) <= 1.5
                 base = app.svar[j].get() if recent or j not in app.pos else app.pos[j]
             t = base + v * TICK_S
             if j in app.pos:                           # never run far ahead of the real arm
@@ -294,24 +298,38 @@ class DrivePanel:
                 age = min(1.0, time.monotonic() - app.pos_t)
                 lead = max(80.0, abs(v) * (0.25 + age))
                 t = max(app.pos[j] - lead, min(app.pos[j] + lead, t))
+            if j == GRIPPER and j not in self.active:
+                self._grip_t0 = time.monotonic()        # this press started now
+            if j == GRIPPER and j in app.pos and app.pos_prev.get(j) is not None \
+                    and app.pos_prev_t > self._grip_t0 + 0.1 \
+                    and abs(app.pos[j] - app.pos_prev[j]) <= 3 and (t - app.pos[j]) * v > GRIP_SQUEEZE:
+                # (both readings taken AFTER the press began, so 'not moving' really means blocked)
+                # jaws stopped moving while we push on = they are on something: squeeze at most
+                # GRIP_SQUEEZE ticks past where they stopped (holding R1 longer won't crush it)
+                t = app.pos[j] + GRIP_SQUEEZE * (1 if v > 0 else -1)
             lo, hi = app._limits(j)
             t = max(lo, min(hi, t))
             self.target[j] = t
             app.set_goal(j, t)
         app._joy_speed = scale if moving else 0
         self.active = set(moving)
-        for j in stopped:
-            self.target.pop(j, None)
+        last = {j: self.target.pop(j, None) for j in stopped}
         if stopped:
-            self._stop_at_actual(stopped)
+            self._stop_at_actual(stopped, last)
 
-    def _stop_at_actual(self, joints):
-        """Let go = stop where the joint IS (not where the target had run ahead to)."""
+    def _stop_at_actual(self, joints, last=None):
+        """Let go = stop where the joint IS (not where the target had run ahead to). The
+        gripper keeps up to GRIP_SQUEEZE of its push, so a block it was closing on stays held."""
         bus, q = self.app.arm.bus, self.app.q
+        last = last or {}
 
         def f():
             try:
-                q.put(("stopat", {j: bus.read_position(j) for j in joints}))
+                at = {j: bus.read_position(j) for j in joints}
+                if GRIPPER in at and last.get(GRIPPER) is not None:
+                    push = last[GRIPPER] - at[GRIPPER]
+                    at[GRIPPER] = int(round(at[GRIPPER] + max(-GRIP_SQUEEZE, min(GRIP_SQUEEZE, push))))
+                q.put(("stopat", at))
             except Exception:  # noqa: BLE001
                 pass
         threading.Thread(target=f, daemon=True).start()

@@ -46,6 +46,7 @@ GRIP_HOLD_TICKS = 15    # squeeze just past the contact point - enough to hold, 
 GRIP_CONTACT_LOAD = 300 # servo load (0.1 %) that also counts as touching something
 GRIP_RAMP = 500         # ticks/s - same speed the grip buttons move the gripper at
 SLIDER_HZ = 40          # max rate slider / stick targets are sent (one no-reply packet each)
+NEVER = float("-inf")    # 'never touched' (monotonic clocks may start near 0)
 TOUCH_HOLD_S = 1.5      # after you touch a slider it stops following the live reading this long
 
 
@@ -67,6 +68,8 @@ class App(tk.Tk):
         self.alive = True
         self.pos: dict[int, int] = {}
         self.pos_t = 0.0                     # when self.pos was read
+        self.pos_prev: dict[int, int] = {}   # the reading before that (stall detection)
+        self.pos_prev_t = 0.0
 
         # game state
         self.board = {c: None for c in CELLS}
@@ -365,11 +368,11 @@ class App(tk.Tk):
                 self.log(val)
             elif kind == "pos":
                 val, faults = val
-                self.pos = val
-                self.pos_t = time.monotonic()
+                self.pos_prev, self.pos = self.pos, val
+                self.pos_prev_t, self.pos_t = self.pos_t, time.monotonic()
                 now = time.monotonic()
                 for j, v in val.items():
-                    if self._grab.get(j) is None and now - self.touched.get(j, 0) > TOUCH_HOLD_S:
+                    if self._grab.get(j) is None and now - self.touched.get(j, NEVER) > TOUCH_HOLD_S:
                         self.svar[j].set(v)          # idle slider follows the real arm
                     self._show(j)
                 warn = self._check_faults(faults)
@@ -451,7 +454,7 @@ class App(tk.Tk):
         now = f"{v:4d} {self._ang(j, v)}" if v is not None else "----"
         g = self.svar[j].get()
         tgt = (f"  → {g:4d} {self._ang(j, g).strip()}"
-               if time.monotonic() - self.touched.get(j, 0) <= TOUCH_HOLD_S and g != v else "")
+               if time.monotonic() - self.touched.get(j, NEVER) <= TOUCH_HOLD_S and g != v else "")
         self.jlbl[j].config(text=now + tgt)
 
     def _can_slide(self, j):
@@ -530,7 +533,7 @@ class App(tk.Tk):
         """± buttons, wheel, arrows: one step from where the joint is heading."""
         if not self._can_slide(j):
             return
-        recent = time.monotonic() - self.touched.get(j, 0) <= TOUCH_HOLD_S
+        recent = time.monotonic() - self.touched.get(j, NEVER) <= TOUCH_HOLD_S
         base = self.svar[j].get() if recent or j not in self.pos else self.pos[j]
         self.set_goal(j, base + sign * (ticks or self.step.get()))
 

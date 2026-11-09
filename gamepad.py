@@ -5,8 +5,8 @@ automatically; unplug it and every stick reads zero, so the arm stops.
 
   left stick   ↔ base      ↕ shoulder
   right stick  ↔ wrist     ↕ elbow
-  R1           close the gripper GENTLY (stops the moment it touches something)
-  L1           open the gripper fully
+  hold R1      close the gripper step by step (let go = stop; won't crush past contact)
+  hold L1      open the gripper step by step
   hold L2      precision (¼ speed)
   A B X Y      go to that preset pose          hold View + A/B/X/Y = save the arm here
   D-pad ↓      E-STOP                          D-pad ↑ = RESET STOP
