@@ -5,12 +5,13 @@ automatically; unplug it and every stick reads zero, so the arm stops.
 
   left stick   ↔ base      ↕ shoulder
   right stick  ↔ wrist     ↕ elbow
-  R2 / L2      close / open the gripper (analog: squeeze harder = faster)
-  R1 / L1      grab (this scenario's grip) / open           (same as G / O)
-  ○ / B        E-STOP              Options / Menu   RESET STOP
-  △ / Y        HOLD here           ✕ / A            CAPTURE the selected pose (tab 2)
-  □ / X        hold for precise (¼ speed)
-(PlayStation / Xbox-style labels - e.g. a SCUF Nomad uses A B X Y.)
+  R1           close the gripper GENTLY (stops the moment it touches something)
+  L1           open the gripper fully
+  hold L2      precision (¼ speed)
+  A B X Y      go to that preset pose          hold View + A/B/X/Y = save the arm here
+  Menu (≡)     E-STOP                          tap View = RESET STOP
+  L3 (click)   HOLD here                       R3 (click) = CAPTURE the selected pose (tab 2)
+Face buttons are named by POSITION (Xbox layout: A bottom, B right, X left, Y top).
 
 Handles the common Linux layouts: right stick on RX/RY or Z/RZ, triggers on Z/RZ,
 GAS/BRAKE or as plain buttons.
@@ -29,8 +30,8 @@ ALT_AXES = {0: "lx", 1: "ly", 2: "rx", 5: "ry", 9: "r2", 10: "l2"}              
 DIGITAL_TRIGGERS = {312: "l2", 313: "r2"}
 INVERT = {"ly", "ry"}                     # stick up = +1
 TRIGGERS = {"l2", "r2"}
-BUTTONS = {304: "cross", 305: "circle", 307: "triangle", 308: "square", 310: "l1", 311: "r1",
-           314: "share", 315: "options", 316: "ps", 317: "l3", 318: "r3"}
+BUTTONS = {304: "a", 305: "b", 307: "y", 308: "x", 310: "l1", 311: "r1",     # face buttons by position
+           314: "view", 315: "menu", 316: "home", 317: "l3", 318: "r3"}
 
 
 class PadState:
@@ -53,7 +54,7 @@ class PadState:
             return dict(self.axes), set(self.held)
 
     def event(self, etype: int, code: int, value: int):
-        """Apply one input event. Returns a button name on a button PRESS, else None."""
+        """Apply one input event. Returns 'name' on a button press, '-name' on a release."""
         if etype == EV_ABS and code in self.map:
             name = self.map[code]
             lo, hi = self.ranges.get(code, (0, 255))
@@ -78,6 +79,8 @@ class PadState:
                     self.held.discard(name)
             if value == 1:
                 return name
+            if value == 0:
+                return "-" + name
         return None
 
 
@@ -101,9 +104,10 @@ class Gamepad:
     """Background reader. on_button(name) is called from this thread on each press;
     on_status(text) whenever the connection changes."""
 
-    def __init__(self, on_button, on_status):
+    def __init__(self, on_button, on_status, on_release=None):
         self.state = PadState()
         self.on_button, self.on_status = on_button, on_status
+        self.on_release = on_release or (lambda name: None)
         self.alive = True
         self.connected = False
         threading.Thread(target=self._run, daemon=True).start()
@@ -148,9 +152,11 @@ class Gamepad:
                 for ev in dev.read_loop():
                     if not self.alive:
                         break
-                    pressed = self.state.event(ev.type, ev.code, ev.value)
-                    if pressed:
-                        self.on_button(pressed)
+                    b = self.state.event(ev.type, ev.code, ev.value)
+                    if b and b.startswith("-"):
+                        self.on_release(b[1:])
+                    elif b:
+                        self.on_button(b)
             except OSError:
                 pass                                   # unplugged / out of range
             finally:
@@ -194,6 +200,8 @@ def _diagnose():
             pass
     for ev in dev.read_loop():
         b = st.event(ev.type, ev.code, ev.value)
+        if b and b.startswith("-"):
+            b = None
         a, held = st.snapshot()
         line = "  ".join(f"{k}{v:+.2f}" for k, v in a.items()) + "  " + " ".join(sorted(held))
         print(("PRESS " + b + "   " if b else "") + line + " " * 10, end="\r" if not b else "\n", flush=True)

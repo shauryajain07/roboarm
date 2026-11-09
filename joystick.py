@@ -102,8 +102,9 @@ class DrivePanel:
         self.pad_lbl = tk.Label(parent, text="🎮 looking for a controller…", font=("Arial", 11, "bold"),
                                 fg="#1d4ed8")
         self.pad_lbl.pack(anchor="w", pady=(6, 0))
-        tk.Label(parent, text=("Controller: sticks as below · R2/L2 close/open · R1 grab · L1 open · "
-                               "○ E-STOP · Options reset · △ HOLD · ✕ CAPTURE · hold □ precise"),
+        tk.Label(parent, text=("Controller: sticks as below · R1 gentle close · L1 open · hold L2 precise · "
+                               "A B X Y presets (hold View + button to save) · Menu E-STOP · View reset · "
+                               "L3 HOLD · R3 CAPTURE"),
                  fg="#555", wraplength=640, justify="left").pack(anchor="w")
         tk.Label(parent, text=("Push a stick: the further you push, the faster that joint moves. "
                                "Let go: it stops. Mouse = one stick, keyboard = the other."),
@@ -138,8 +139,20 @@ class DrivePanel:
         for j, v in self.flip.items():
             tk.Checkbutton(ff, text=JOINT_NAMES[j], variable=v, command=self._save_flip).pack(side="left")
 
+        pf = tk.LabelFrame(parent, text="Presets - controller A B X Y (or the Go buttons)")
+        pf.pack(fill="x", padx=6, pady=6)
+        self.preset_lbl = {}
+        for r, n in enumerate("abxy"):
+            tk.Label(pf, text=n.upper(), width=3, font=("Arial", 12, "bold")).grid(row=r, column=0)
+            self.preset_lbl[n] = tk.Label(pf, text="", width=30, anchor="w", font=("Courier", 10))
+            self.preset_lbl[n].grid(row=r, column=1)
+            tk.Button(pf, text="Save here", command=lambda n=n: app.save_preset(n)).grid(row=r, column=2, padx=2)
+            tk.Button(pf, text="Go", width=4, command=lambda n=n: app.go_preset(n)).grid(row=r, column=3, padx=2)
+        self.refresh_presets()
+        self._view_used = False
         self.pad = Gamepad(on_button=self._pad_button,
-                           on_status=lambda t: app.q.put(("pad_status", t)))
+                           on_status=lambda t: app.q.put(("pad_status", t)),
+                           on_release=lambda n: app.q.put(("pad_rel", n)))
         app.bind_all("<KeyPress>", self._key_down, add="+")
         app.bind_all("<KeyRelease>", self._key_up, add="+")
         app.after(int(TICK_S * 1000), self._tick)
@@ -177,7 +190,7 @@ class DrivePanel:
 
     def _pad_button(self, name):
         """Controller thread. E-STOP goes straight out - no waiting for the GUI loop."""
-        if name == "circle":
+        if name == "menu":
             self.app.estop()
         else:
             self.app.q.put(("pad_btn", name))
@@ -185,11 +198,31 @@ class DrivePanel:
     def pad_button(self, name):
         """GUI thread: the controller's action buttons."""
         app = self.app
-        act = {"options": app.reset_stop, "triangle": app.hold, "cross": app.capture,
-               "r1": lambda: app.apply_grip(app.grab_grip()), "l1": lambda: app.apply_grip("open")}.get(name)
+        if name == "view":
+            self._view_used = False
+            return
+        if name in "abxy" and len(name) == 1:
+            _, held = self.pad.state.snapshot()
+            if "view" in held:                     # View + face button = save here
+                self._view_used = True
+                return app.save_preset(name)
+            return app.go_preset(name)
+        act = {"l3": app.hold, "r3": app.capture,
+               "r1": app.close_gently, "l1": app.open_full}.get(name)
         if act:
-            app.log(f"🎮 {name}")
+            app.log(f"🎮 {name.upper()}")
             act()
+
+    def pad_release(self, name):
+        if name == "view" and not self._view_used:   # a plain tap of View = reset the stop
+            self.app.log("🎮 View -> reset stop")
+            self.app.reset_stop()
+
+    def refresh_presets(self):
+        for n, l in self.preset_lbl.items():
+            p = self.app.data.presets.get(n)
+            l.config(text=" ".join(f"{p[j]:4d}" for j in sorted(p)) if p else "(empty)",
+                     fg="black" if p else "#9ca3af")
 
     def _save_flip(self):
         self.app.data.joy_flip = [j for j, v in self.flip.items() if v.get()]
@@ -226,12 +259,11 @@ class DrivePanel:
 
     def _step(self):
         app = self.app
-        axes, pad_held = self.pad.state.snapshot()
-        slow = self.precise.get() or self.shift or "square" in pad_held
+        axes, _ = self.pad.state.snapshot()
+        slow = self.precise.get() or self.shift or axes["l2"] > 0.4      # hold L2 = precision
         scale = self.vmax.get() * (0.25 if slow else 1.0)
         moving = {j: v * scale for j, v in self._speeds().items()}
-        trig = axes["r2"] - axes["l2"]                 # analog: squeeze harder = faster
-        grip = self.grip_dir or (trig if abs(trig) > 0.08 else 0)
+        grip = self.grip_dir
         if grip:
             g = app.data.grips
             closes_up = not (g.get("open") is not None and app.data.closed_values()

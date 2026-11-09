@@ -41,6 +41,9 @@ ST = {"saved": "✓", "ready": "●", "todo": "○"}
 # never snaps the arm - pick "gentle" near the rack, "fast" for big repositioning.
 SLIDER_SPEEDS = {"gentle": (200, 15), "normal": (450, 35), "fast": (900, 80)}
 SERVO_TOP_SPEED = 3000  # ST3215 real-world top speed, ticks/s
+GRIP_CLOSE_SPEED = 250  # ticks/s while feeling for an object (slow = gentle contact)
+GRIP_HOLD_TICKS = 15    # squeeze just past the contact point - enough to hold, not to crush
+GRIP_CONTACT_LOAD = 300 # servo load (0.1 %) that also counts as touching something
 GRIP_RAMP = 500         # ticks/s - same speed the grip buttons move the gripper at
 SLIDER_HZ = 40          # max rate slider / stick targets are sent (one no-reply packet each)
 TOUCH_HOLD_S = 1.5      # after you touch a slider it stops following the live reading this long
@@ -379,6 +382,8 @@ class App(tk.Tk):
                         self.set_goal(j, v)
             elif kind == "pad_btn":
                 self.drive.pad_button(val)
+            elif kind == "pad_rel":
+                self.drive.pad_release(val)
             elif kind == "pad_status":
                 self.drive.pad_lbl.config(text=val)
                 self.log(val)
@@ -577,6 +582,10 @@ class App(tk.Tk):
         self.run(f)
 
     def apply_grip(self, g):
+        if g == "open":
+            return self.open_full()
+        if g in BLOCKS:                    # block grips feel for the block and stop on contact
+            return self.close_gently(self.data.grips.get(g), label=g)
         if g not in self.data.grips:
             return self.log(f"grip '{g}' not set yet (tab 1)")
         v = self.data.grips[g]
@@ -589,6 +598,112 @@ class App(tk.Tk):
             threading.Thread(target=act, daemon=True).start()
         else:
             self.run(act)
+
+    # ---------------------------------------------------------------- gentle gripper
+    def _grip_dirs(self):
+        """(closing direction +1/-1, fully-open ticks, fully-closed ticks) within the limits."""
+        lo, hi = self._limits(GRIPPER)
+        g = self.data.grips
+        closes_up = not (g.get("open") is not None and self.data.closed_values()
+                         and max(self.data.closed_values()) < g["open"])
+        return (1, lo, hi) if closes_up else (-1, hi, lo)
+
+    def open_full(self):
+        """Open the jaws as wide as the gripper limits allow (L1, O, 'open')."""
+        _, widest, _ = self._grip_dirs()
+
+        def f():
+            self.arm.bus.set_torque(GRIPPER, True)
+            self._apply_grip_strength()
+            self.arm.bus.write_position(GRIPPER, widest, GRIP_RAMP, 50)
+            self.arm.gripper_goal = widest
+        self.slider_owned.discard(GRIPPER)
+        if self.recording:
+            self._rec_grip = widest
+            self.log("  gripper -> open")
+        self._grip_job(f)
+
+    def close_gently(self, target=None, label="close"):
+        """Close slowly and STOP the moment the jaws meet something (the servo stalls or its
+        load jumps), then hold just GRIP_HOLD_TICKS past contact. Closes no further than
+        `target` (default: fully closed). Nothing in the jaws -> stops at the target."""
+        d, _, tightest = self._grip_dirs()
+        end = tightest if target is None else (min(target, tightest) if d > 0 else max(target, tightest))
+        bus, q = self.arm.bus, self.q
+        rec = self.recording
+
+        def f():
+            bus.set_torque(GRIPPER, True)
+            self._apply_grip_strength()
+            start = last = bus.read_position(GRIPPER)
+            if (end - start) * d <= 0:
+                q.put(("log", f"gripper already at or past '{label}'"))
+                return
+            bus.write_position(GRIPPER, end, GRIP_CLOSE_SPEED, 50)
+            t0, still = time.monotonic(), 0
+            limit_s = abs(end - start) / GRIP_CLOSE_SPEED + 1.5      # full travel + margin
+            while time.monotonic() - t0 < limit_s:
+                if self.arm.estop.is_set():
+                    return
+                time.sleep(0.015)
+                p = bus.read_position(GRIPPER)
+                if rec:
+                    self._rec_grip = p
+                if abs(end - p) <= 8:
+                    q.put(("log", f"gripper closed to '{label}' - nothing in the jaws"))
+                    self.arm.gripper_goal = end
+                    return
+                try:
+                    load = abs(bus.read_load(GRIPPER))
+                except Exception:  # noqa: BLE001
+                    load = 0
+                still = still + 1 if abs(p - last) <= 2 else 0
+                moved = (p - start) * d
+                started = time.monotonic() - t0 > 0.35
+                if load >= GRIP_CONTACT_LOAD or (still >= 3 and (moved > 15 or started)):
+                    hold = p + d * GRIP_HOLD_TICKS
+                    bus.write_position(GRIPPER, hold, 200, 50)
+                    self.arm.gripper_goal = hold
+                    if rec:
+                        self._rec_grip = hold
+                    q.put(("log", f"🤏 gripped at {p} (holding {hold}, load {load / 10:.0f} %)"))
+                    return
+                last = p
+            q.put(("log", "gripper: didn't reach the end or feel contact - stopped where it is"))
+            bus.write_position(GRIPPER, bus.read_position(GRIPPER), 200, 50)
+        self.slider_owned.discard(GRIPPER)
+        if rec:
+            self.log(f"  gripper -> {label} (gentle)")
+        self._grip_job(f)
+
+    def _grip_job(self, f):
+        if self.recording:                   # during a fluid take: don't block the recorder
+            threading.Thread(target=f, daemon=True).start()
+        else:
+            self.run(f)
+
+    # ---------------------------------------------------------------- presets (A B X Y)
+    def save_preset(self, name):
+        if not self._need_pos():
+            return
+        pose = {j: self.pos[j] for j in ARM_JOINTS}
+        self.data.presets[name] = pose
+        self.data.save()
+        self.log(f"preset {name.upper()} saved: {' '.join(str(pose[j]) for j in ARM_JOINTS)}")
+        self.drive.refresh_presets()
+
+    def go_preset(self, name):
+        pose = self.data.presets.get(name)
+        if not pose:
+            return self.log(f"preset {name.upper()} is empty - hold View and press {name.upper()} "
+                            "(or 'Save here' on the Drive tab) to set it")
+        speed = self.arm.cfg["speed"]
+
+        def f():
+            self.arm.torque(True, ARM_JOINTS)
+            self.arm.move_to(dict(pose), speed=speed)     # arm only: the gripper keeps its grip
+        self.log(f"-> preset {name.upper()}")
+        self.run(f)
 
     def set_grip_strength(self):
         pct = int(self.grip_pct.get())

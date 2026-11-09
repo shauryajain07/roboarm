@@ -114,12 +114,14 @@ class ScenarioData:
         self.notes: dict[str, str] = {}       # "scenario/LABEL" -> note (e.g. provisional pose)
         self.grip_strength = 50               # % of the gripper servo's max torque
         self.joy_flip: list[int] = []         # joystick axes reversed (joint ids)
+        self.presets: dict[str, dict[int, int]] = {}   # controller A/B/X/Y -> arm pose
         if self.path.exists():
             d = json.loads(self.path.read_text())
             self.notes = dict(d.get("notes", {}))
             self.grip_strength = int(d.get("grip_strength", 50))
             self.joy_flip = [int(j) for j in d.get("joy_flip", [])]
             ints = lambda p: {int(k): int(v) for k, v in p.items()}
+            self.presets = {k: ints(v) for k, v in d.get("presets", {}).items()}
             self.shared = {k: ints(v) for k, v in d.get("shared", {}).items()}
             self.grips = {k: int(v) for k, v in d.get("grips", {}).items()}
             self.captures = {s: {l: ints(p) for l, p in c.items()} for s, c in d.get("captures", {}).items()}
@@ -131,7 +133,8 @@ class ScenarioData:
              "captures": {s: {l: strs(p) for l, p in c.items()} for s, c in sorted(self.captures.items())},
              "notes": self.notes,
              "grip_strength": self.grip_strength,
-             "joy_flip": self.joy_flip}
+             "joy_flip": self.joy_flip,
+             "presets": {k: strs(v) for k, v in self.presets.items()}}
         tmp = self.path.with_suffix(".tmp")
         tmp.write_text(json.dumps(d, indent=1))
         os.replace(tmp, self.path)
