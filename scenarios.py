@@ -197,9 +197,13 @@ def fluid_path(name: str, folder: Path | None = None) -> Path:
     return Path(folder or TRAJ_DIR) / f"{name}.json"
 
 
-def stop_flags(name: str, pts: list[dict]) -> list[bool]:
-    """Rest at: ends, precision rows (GRAB/IN/HIT/PREHIT), and around gripper changes."""
+def stop_flags(name: str, pts: list[dict], glide: bool = False) -> list[bool]:
+    """Default: come to rest at EVERY waypoint, so the arm moves straight from one captured
+    pose to the next (gliding through ABOVE / FRONT swung the arm diagonally into the grab /
+    the hole). glide=True: rest only at ends, precision rows and gripper changes."""
     rows = template(name)
+    if not glide:
+        return [True] * len(rows)
     flags = []
     for i, r in enumerate(rows):
         g_change = ((i > 0 and pts[i][GRIPPER] != pts[i - 1][GRIPPER]) or
@@ -213,7 +217,7 @@ def fluid_from_waypoints(data: "ScenarioData", name: str, cfg: dict):
     import trajectory
     pts = data.points(name)
     sp = [cfg["max_speed"] if s == "max" else cfg.get("fluid_speed", 1100) for s in speeds(name)]
-    tr = trajectory.from_waypoints(pts, stop_flags(name, pts), sp)
+    tr = trajectory.from_waypoints(pts, stop_flags(name, pts, cfg.get("glide_waypoints", False)), sp)
     tr.meta.update(scenario=name)
     return tr
 

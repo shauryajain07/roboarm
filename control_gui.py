@@ -40,6 +40,7 @@ ST = {"saved": "✓", "ready": "●", "todo": "○"}
 # never snaps the arm - pick "gentle" near the rack, "fast" for big repositioning.
 SLIDER_SPEEDS = {"gentle": (200, 15), "normal": (450, 35), "fast": (900, 80)}
 SERVO_TOP_SPEED = 3000  # ST3215 real-world top speed, ticks/s
+GRIP_RAMP = 500         # ticks/s - same speed the grip buttons move the gripper at
 SLIDER_HZ = 20          # max rate slider targets are sent to the servos
 TOUCH_HOLD_S = 1.5      # after you touch a slider it stops following the live reading this long
 
@@ -80,6 +81,7 @@ class App(tk.Tk):
         self.goal_lock = threading.Lock()
         self.touched: dict[int, float] = {}
         self._grab: dict[int, float | None] = {}
+        self._rec_grip: int | None = None       # gripper value COMMANDED during a fluid recording
         self._sync_ok: bool | None = None       # SYNC READ supported? (None = not tried yet)
         self.slider_owned: set[int] = set()   # joints whose latest command came from a slider
         self._backed_off: set[int] = set()
@@ -439,6 +441,8 @@ class App(tk.Tk):
         with self.goal_lock:
             self.goal[j] = v
         self.slider_owned.add(j)
+        if self.recording and j == GRIPPER:
+            self._rec_grip = v
         self._show(j)
 
     def _check_faults(self, faults):
@@ -534,9 +538,10 @@ class App(tk.Tk):
         v = self.data.grips[g]
         self.slider_owned.discard(GRIPPER)
         act = lambda: (self.arm.bus.set_torque(GRIPPER, True),
-                       self.arm.move_to({GRIPPER: v}, speed=500, ignore=(GRIPPER,)))
+                       self.arm.move_to({GRIPPER: v}, speed=GRIP_RAMP, ignore=(GRIPPER,)))
         if self.recording:            # grab / release DURING a fluid recording
             self.log(f"  gripper -> {g}")
+            self._rec_grip = v
             threading.Thread(target=act, daemon=True).start()
         else:
             self.run(act)
@@ -764,6 +769,7 @@ class App(tk.Tk):
                 time.sleep(0.7)
                 log(f"  {k}…")
             time.sleep(0.7)
+            self._rec_grip = int(start[GRIPPER])
             log("  ● RECORDING - move through the scenario, end at SAFE, press ■ Stop")
             hz = self.arm.cfg.get("record_hz", 100)
             raw = trajectory.record(self._read_fast, self.rec_stop, hz=hz,
@@ -773,6 +779,9 @@ class App(tk.Tk):
             self.arm.torque(True)
             if len(raw) < 2:
                 raise ValueError("recording too short - nothing saved")
+            trajectory.ramp_channel(raw, GRIPPER, GRIP_RAMP)   # gripper moves at its real speed
+            full = raw.duration
+            raw = trajectory.trim_still(raw)                  # dead time at the ends only
             # saved exactly as recorded: no smoothing, trimming, pause-shortening or snapping
             got = round((len(raw) - 1) / raw.duration, 1) if raw.duration else 0
             rep = {"duration_s": round(raw.duration, 2), "samples": len(raw), "hz": got, "cleaned": False}
@@ -780,13 +789,15 @@ class App(tk.Tk):
             trajectory.save(sc.fluid_path(name, self.traj_folder), raw, name,
                             f"roboarm fluid take (exact): {name}", self.names, extra={"report": rep})
             log(f"  ✓ saved exactly as recorded: {rep['duration_s']} s, {len(raw)} samples "
-                f"({got} Hz{', bus is the limit' if got < 0.9 * hz else ''}). Press ▶ Test.")
+                f"({got} Hz{', bus is the limit' if got < 0.9 * hz else ''}; "
+                f"{full - raw.duration:.1f} s of standing still cut from the ends). Press ▶ Test.")
         except EStop:
             log("stopped by E-STOP - recording discarded")
         except Exception as e:  # noqa: BLE001
             log(f"ERROR: {e}")
         finally:
             self.recording = False
+            self._rec_grip = None
             self.rec_stop = None
             self.q.put(("done", done))
 
@@ -797,13 +808,20 @@ class App(tk.Tk):
             try:
                 r = self.arm.bus.sync_read_positions(JOINT_IDS)
                 self._sync_ok = True
-                return r
+                return self._with_grip_cmd(r)
             except ServoError:
                 if self._sync_ok:            # worked before: just a dropped sample
                     raise
                 self._sync_ok = False
                 self.q.put(("log", "  (this bus has no SYNC READ - reading the 5 servos one by one)"))
-        return self.arm.read_all()
+        return self._with_grip_cmd(self.arm.read_all())
+
+    def _with_grip_cmd(self, pose):
+        """Record the gripper as what it was TOLD (e.g. the 'cube' squeeze value), not where
+        the jaws stopped on the block - otherwise playback only holds at touching pressure."""
+        if self._rec_grip is not None:
+            pose[GRIPPER] = self._rec_grip
+        return pose
 
     def discard_fluid(self):
         name = self.selected()

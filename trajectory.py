@@ -94,6 +94,38 @@ def record(read_all, stop_event, hz: float = 25.0, on_sample=None, max_s: float 
     return tr
 
 
+def trim_still(tr: Traj, ticks: float = 8, keep_s: float = 0.25) -> Traj:
+    """Cut only the dead time before the first movement and after the last one (the wait
+    before you start moving, and reaching for ■ Stop). Every sample in between is kept
+    exactly as recorded. Times are rebased to start at 0."""
+    if len(tr) < 3:
+        return tr
+    q0, q1 = tr.q[0], tr.q[-1]
+    moved = lambda i, ref: any(abs(tr.q[i][j] - ref[j]) > ticks for j in ref)
+    a = next((i for i in range(len(tr)) if moved(i, q0)), 0)
+    b = next((i for i in range(len(tr) - 1, -1, -1) if moved(i, q1)), len(tr) - 1)
+    t_a, t_b = max(tr.t[0], tr.t[a] - keep_s), min(tr.t[-1], tr.t[b] + keep_s)
+    keep = [i for i in range(len(tr)) if t_a <= tr.t[i] <= t_b]
+    if len(keep) < 2:
+        return tr
+    return Traj([tr.t[i] - tr.t[keep[0]] for i in keep], [dict(tr.q[i]) for i in keep], dict(tr.meta))
+
+
+def ramp_channel(tr: Traj, j: int, rate: float) -> None:
+    """In place: make joint j move toward each recorded value at most `rate` ticks/s.
+    Used for the gripper, which is recorded as the COMMANDED value (a step when you press a
+    grip button) so playback squeezes as hard as live - ramped at the gripper's real speed."""
+    if len(tr) < 2:
+        return
+    cur = tr.q[0][j]
+    for k in range(1, len(tr)):
+        dt = tr.t[k] - tr.t[k - 1]
+        want = tr.q[k][j]
+        step = rate * dt
+        cur = want if abs(want - cur) <= step else cur + (step if want > cur else -step)
+        tr.q[k][j] = cur
+
+
 # ============================================================================ clean
 def _median3(xs):
     if len(xs) < 3:
@@ -330,7 +362,9 @@ def play(arm, tr: Traj, rate: float = 1.0, hz: float = 40.0, ignore_gripper: boo
         q = tr.at(tt * rate)
         target = _clamp_overshoot({j: int(round(v)) for j, v in q.items()}, cfg)
         arm.check_limits(target)
-        cmd = {j: (v, int(min(cfg["max_speed"], abs(q[j] - prev[j]) / period * 1.3 + 40)),
+        # generous speed limit: the servo must be able to CATCH UP if it falls behind,
+        # otherwise lag builds up through the take and the arm snaps at the end
+        cmd = {j: (v, int(min(cfg["max_speed"], abs(q[j] - prev[j]) / period * 2.0 + 300)),
                    acc) for j, v in target.items()}
         arm.bus.sync_write_positions(cmd)
         arm.gripper_goal = target.get(GRIPPER, arm.gripper_goal)
