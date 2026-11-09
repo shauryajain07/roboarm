@@ -36,6 +36,17 @@ POS_MIN, POS_MAX = 0, 4095
 SPEED_MAX = 4095
 ACC_MAX = 255
 
+# status-reply error bits (same as the official scservo_sdk). The servo still did the
+# READ/WRITE - these are warnings that stay set while the condition lasts.
+FAULT_BITS = {0x01: "voltage", 0x02: "angle limit", 0x04: "overheat",
+              0x08: "over-current", 0x20: "overload"}
+STRAIN_BITS = 0x04 | 0x08 | 0x20     # the motor is fighting something
+
+
+def describe_fault(err: int) -> str:
+    return ", ".join(n for b, n in FAULT_BITS.items() if err & b) or f"error 0x{err:02x}"
+
+
 DEFAULT_TIMEOUT_S = 0.25   # same as the web tool
 PING_TIMEOUT_S = 0.5
 FLUSH_AFTER_TIMEOUT_S = 0.05
@@ -144,6 +155,7 @@ class ServoBus:
         self.write_replies = write_replies  # web tool waits for a status after every WRITE
         self._lock = threading.Lock()
         self._rx = bytearray()
+        self.faults: dict[int, int] = {}    # servo id -> error bits in its latest reply (0 = ok)
 
     def close(self):
         self.ser.close()
@@ -178,8 +190,10 @@ class ServoBus:
                         continue
                     if n_params is not None and len(status["params"]) != n_params:
                         continue
-                    if status["error"]:
-                        raise ServoError(f"servo {expect_id} error byte 0x{status['error']:02x}")
+                    # a set error bit is a warning, not a failed command: record it for
+                    # the GUI instead of raising (raising made every read fail while
+                    # e.g. the gripper was overloaded, so the whole readout died)
+                    self.faults[expect_id] = status["error"]
                     return status
             time.sleep(FLUSH_AFTER_TIMEOUT_S)
             self._flush()
@@ -233,6 +247,7 @@ class _SimServo:
     speed: float = 300
     torque: bool = False
     load: int = 0
+    err: int = 0          # error bits sent in every reply (tests simulate overload with it)
 
 
 class MockTransport:
@@ -264,7 +279,7 @@ class MockTransport:
                     s.pos, s.load = self.gripper_block_at, 400   # jaws stall on block
 
     def _reply(self, sid, params=b""):
-        body = [sid, len(params) + 2, 0, *params]
+        body = [sid, len(params) + 2, self.servos[sid].err if sid in self.servos else 0, *params]
         self._out += bytes([0xFF, 0xFF, *body, checksum(body)])
 
     def write(self, pkt: bytes):

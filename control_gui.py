@@ -30,7 +30,7 @@ import strategy
 import trajectory
 from motion import HERE, Arm, EStop, LimitError, load_config, open_bus
 from poses import ARM_JOINTS, BLOCK_POINTS, BLOCKS, CELLS, GRIPPER, JOINT_IDS, JOINT_NAMES, PoseStore
-from servo_bus import ServoError, mock_bus
+from servo_bus import STRAIN_BITS, ServoError, describe_fault, mock_bus
 
 GAME_SECONDS = 180
 MAX_TOKENS = 3
@@ -79,6 +79,8 @@ class App(tk.Tk):
         self.goal_lock = threading.Lock()
         self.touched: dict[int, float] = {}
         self._grab: dict[int, float | None] = {}
+        self.slider_owned: set[int] = set()   # joints whose latest command came from a slider
+        self._backed_off: set[int] = set()
         self._build()
         for k in ("<space>", "<Escape>"):
             self.bind_all(k, lambda e: self.estop())
@@ -117,8 +119,17 @@ class App(tk.Tk):
         self.logbox.pack(fill="x", padx=6, pady=4)
 
     def _limits(self, j):
-        lo, hi = self.arm.cfg["joint_limits"].get(str(j), (0, 4095))
-        return int(lo), int(hi)
+        lo, hi = (int(v) for v in self.arm.cfg["joint_limits"].get(str(j), (0, 4095)))
+        if j == GRIPPER:
+            # never let the slider close past the tightest recorded grip ('attack' = fully
+            # closed): beyond it the jaws hit each other and the servo overloads
+            opn, closed = self.data.grips.get("open"), self.data.closed_values()
+            if opn is not None and closed:
+                if max(closed) > opn:
+                    hi = min(hi, max(closed))
+                else:
+                    lo = max(lo, min(closed))
+        return lo, hi
 
     def _build_joints(self, parent):
         f = tk.LabelFrame(parent, text="Arm - drag a slider to move that joint")
@@ -310,7 +321,7 @@ class App(tk.Tk):
         while self.alive:
             if not self.running and not self.arm.estop.is_set():
                 try:
-                    self.q.put(("pos", self.arm.read_all()))
+                    self.q.put(("pos", (self.arm.read_all(), dict(self.arm.bus.faults))))
                 except Exception as e:  # noqa: BLE001
                     self.q.put(("conn", str(e)))
             time.sleep(0.3)
@@ -321,14 +332,17 @@ class App(tk.Tk):
             if kind == "log":
                 self.log(val)
             elif kind == "pos":
+                val, faults = val
                 self.pos = val
                 now = time.monotonic()
                 for j, v in val.items():
                     if self._grab.get(j) is None and now - self.touched.get(j, 0) > TOUCH_HOLD_S:
                         self.svar[j].set(v)          # idle slider follows the real arm
                     self._show(j)
+                warn = self._check_faults(faults)
                 self.status.config(text=f"connected · {self.arm.cfg['port']} @ {self.arm.cfg['baud']}"
-                                        + ("   ⛔ E-STOP" if self.arm.estop.is_set() else ""))
+                                        + ("   ⛔ E-STOP" if self.arm.estop.is_set() else "") + warn,
+                                   fg="#b91c1c" if warn else "black")
             elif kind == "conn":
                 self.status.config(text=f"⚠ servo read failed: {val}")
             elif kind == "rec":
@@ -353,6 +367,7 @@ class App(tk.Tk):
             self.log("busy - wait for the current move to finish")
             return
         self.running = True
+        self.slider_owned.clear()          # a scripted move now owns the joints
 
         def work():
             done = None
@@ -415,7 +430,24 @@ class App(tk.Tk):
         self.touched[j] = time.monotonic()
         with self.goal_lock:
             self.goal[j] = v
+        self.slider_owned.add(j)
         self._show(j)
+
+    def _check_faults(self, faults):
+        """Servo warning bits from the last poll. If a joint the SLIDER is driving is straining
+        (overload / over-current / overheat) it is pushing into something it can't move -
+        retarget it to where it actually is so it stops fighting. Returns status-bar text."""
+        bad = {j: e for j, e in faults.items() if e}
+        for j, e in bad.items():
+            if e & STRAIN_BITS and j in self.slider_owned and not self.running and j in self.pos:
+                if j not in self._backed_off:
+                    self.log(f"⚠ {j} {JOINT_NAMES[j]}: {describe_fault(e)} - it is pushing against something. "
+                             f"Slider backed off to where the joint really is ({self.pos[j]}).")
+                    self._backed_off.add(j)
+                self.set_goal(j, self.pos[j])
+        self._backed_off &= set(bad)
+        return ("   ⚠ " + "; ".join(f"{j} {JOINT_NAMES[j]}: {describe_fault(e)}" for j, e in sorted(bad.items()))
+                if bad else "")
 
     def _value_at(self, j, e):
         s = self.sliders[j]
@@ -492,6 +524,7 @@ class App(tk.Tk):
         if g not in self.data.grips:
             return self.log(f"grip '{g}' not set yet (tab 1)")
         v = self.data.grips[g]
+        self.slider_owned.discard(GRIPPER)
         act = lambda: (self.arm.bus.set_torque(GRIPPER, True),
                        self.arm.move_to({GRIPPER: v}, speed=500, ignore=(GRIPPER,)))
         if self.recording:            # grab / release DURING a fluid recording
@@ -552,6 +585,8 @@ class App(tk.Tk):
             self.data.grips[g] = self.arm.bus.read_position(GRIPPER)
             self.data.save()
             self.log(f"set grip {g} = {self.data.grips[g]}")
+            lo, hi = self._limits(GRIPPER)
+            self.sliders[GRIPPER].config(from_=lo, to=hi)
             self.refresh_all()
 
     def rebuild_all(self):
