@@ -177,7 +177,9 @@ class ServoBus:
                 return None
             deadline = time.monotonic() + timeout
             while time.monotonic() < deadline:
-                chunk = self.ser.read(64)
+                # take whatever has arrived (at least 1 byte) - read(64) would sit out the
+                # whole 10 ms port timeout on every reply, capping recording at ~16 Hz
+                chunk = self.ser.read(self.ser.in_waiting or 1)
                 if not chunk:
                     continue
                 self._rx += chunk
@@ -247,7 +249,9 @@ class ServoBus:
             self.ser.write(pkt)
             deadline = time.monotonic() + timeout
             while len(out) < len(ids) and time.monotonic() < deadline:
-                chunk = self.ser.read(64)
+                # take whatever has arrived (at least 1 byte) - read(64) would sit out the
+                # whole 10 ms port timeout on every reply, capping recording at ~16 Hz
+                chunk = self.ser.read(self.ser.in_waiting or 1)
                 if not chunk:
                     continue
                 self._rx += chunk
@@ -361,6 +365,10 @@ class MockTransport:
         elif addr == ADDR_ACC and s.torque:
             s.goal = data[1] | (data[2] << 8)
             s.speed = data[5] | (data[6] << 8)
+
+    @property
+    def in_waiting(self) -> int:
+        return len(self._out)
 
     def read(self, n: int) -> bytes:
         self._tick()

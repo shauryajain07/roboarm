@@ -765,7 +765,7 @@ class App(tk.Tk):
                 log(f"  {k}…")
             time.sleep(0.7)
             log("  ● RECORDING - move through the scenario, end at SAFE, press ■ Stop")
-            hz = self.arm.cfg.get("record_hz", 50)
+            hz = self.arm.cfg.get("record_hz", 100)
             raw = trajectory.record(self._read_fast, self.rec_stop, hz=hz,
                                     on_sample=lambda n, t: n % 10 == 0 and self.q.put(("rec", (n, t))))
             cur = self.arm.read_all()

@@ -33,7 +33,7 @@ DEFAULT_CONFIG = {
     "max_acc": 254,          # 'max' steps: highest acceleration (same as official MOVE_ACCELERATION)
     "fluid_speed": 1100,     # peak ticks/s of smooth (fluid) playback; GUI slider scales it
     "stream_hz": 50,         # how often fluid playback updates the servo targets
-    "record_hz": 50,         # samples per second when recording a fluid take
+    "record_hz": 100,        # target samples/s for fluid takes (the bus decides what's reached)
     "stream_acc": 150,       # servo acceleration while streaming
     "acc": 30,
     "arrive_tolerance": 15,  # ticks (~1.3 deg)
