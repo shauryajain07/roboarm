@@ -319,6 +319,8 @@ def play(arm, tr: Traj, rate: float = 1.0, hz: float = 40.0, ignore_gripper: boo
             raise
     period = 1.0 / hz
     t_end = tr.t[-1] / rate
+    # faster playback needs snappier servos: scale acceleration with the rate (capped at max)
+    acc = int(min(cfg.get("max_acc", 254), cfg.get("stream_acc", 150) * max(1.0, rate)))
     t0 = time.monotonic()
     prev = tr.at(0)
     while True:
@@ -329,7 +331,7 @@ def play(arm, tr: Traj, rate: float = 1.0, hz: float = 40.0, ignore_gripper: boo
         target = _clamp_overshoot({j: int(round(v)) for j, v in q.items()}, cfg)
         arm.check_limits(target)
         cmd = {j: (v, int(min(cfg["max_speed"], abs(q[j] - prev[j]) / period * 1.3 + 40)),
-                   cfg.get("stream_acc", 150)) for j, v in target.items()}
+                   acc) for j, v in target.items()}
         arm.bus.sync_write_positions(cmd)
         arm.gripper_goal = target.get(GRIPPER, arm.gripper_goal)
         prev = q

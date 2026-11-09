@@ -39,6 +39,7 @@ ST = {"saved": "✓", "ready": "●", "todo": "○"}
 # manual sliders: (ticks/s, acceleration). The servo eases toward the slider, so yanking it
 # never snaps the arm - pick "gentle" near the rack, "fast" for big repositioning.
 SLIDER_SPEEDS = {"gentle": (200, 15), "normal": (450, 35), "fast": (900, 80)}
+SERVO_TOP_SPEED = 3000  # ST3215 real-world top speed, ticks/s
 SLIDER_HZ = 20          # max rate slider targets are sent to the servos
 TOUCH_HOLD_S = 1.5      # after you touch a slider it stops following the live reading this long
 
@@ -100,8 +101,13 @@ class App(tk.Tk):
         tk.Button(top, text="RESET STOP", command=self.reset_stop).pack(side="right", padx=4)
         tk.Button(top, text="E-STOP  (Space)", bg="#b91c1c", fg="white", font=("Arial", 13, "bold"),
                   command=self.estop).pack(side="right")
-        tk.Scale(top, variable=self.rate, from_=0.5, to=2.0, resolution=0.1, orient="horizontal",
-                 length=150, label="playback speed ×").pack(side="right", padx=12)
+        sp = tk.Frame(top)
+        sp.pack(side="right", padx=12)
+        tk.Scale(sp, variable=self.rate, from_=0.5, to=4.0, resolution=0.1, orient="horizontal",
+                 length=200, label="playback speed ×").pack(side="left")
+        for r in (1, 2, 4):          # one-click presets
+            tk.Button(sp, text=f"{r}×", width=3, font=("Arial", 11, "bold"),
+                      command=lambda r=r: self.rate.set(r)).pack(side="left", padx=1, anchor="s")
 
         body = tk.Frame(self)
         body.pack(fill="both", expand=True, padx=6)
@@ -709,6 +715,10 @@ class App(tk.Tk):
         if src == "recorded":
             tr = trajectory.load(sc.fluid_path(name, self.traj_folder), self.names)
         self.arm.log(f"  ▶ {name} ({src}, {tr.duration / rate:.1f} s at ×{rate:g})")
+        need = trajectory.max_speed(tr) * rate
+        if need > SERVO_TOP_SPEED:
+            self.arm.log(f"  ⚠ at ×{rate:g} this needs {need:.0f} ticks/s but the servos top out near "
+                         f"{SERVO_TOP_SPEED} - the arm will lag behind and cut corners. Try a lower speed.")
         self.arm.torque(True)
         last_g = int(round(tr.q[-1][GRIPPER]))
         trajectory.play(self.arm, tr, rate=rate, hz=self.arm.cfg.get("stream_hz", 50),
