@@ -7,9 +7,13 @@ automatically; unplug it and every stick reads zero, so the arm stops.
   right stick  ↔ wrist     ↕ elbow
   R2 / L2      close / open the gripper (analog: squeeze harder = faster)
   R1 / L1      grab (this scenario's grip) / open           (same as G / O)
-  ○ Circle     E-STOP              Options   RESET STOP
-  △ Triangle   HOLD here           ✕ Cross   CAPTURE the selected pose (tab 2)
-  □ Square     hold for precise (¼ speed)
+  ○ / B        E-STOP              Options / Menu   RESET STOP
+  △ / Y        HOLD here           ✕ / A            CAPTURE the selected pose (tab 2)
+  □ / X        hold for precise (¼ speed)
+(PlayStation / Xbox-style labels - e.g. a SCUF Nomad uses A B X Y.)
+
+Handles the common Linux layouts: right stick on RX/RY or Z/RZ, triggers on Z/RZ,
+GAS/BRAKE or as plain buttons.
 
 Needs:  sudo apt install python3-evdev   (the Pi user must be in the 'input' group - it is by default)
 """
@@ -20,7 +24,9 @@ import time
 
 # Linux input event codes (numbers, so the mapping can be tested without evdev installed)
 EV_KEY, EV_ABS = 1, 3
-AXES = {0: "lx", 1: "ly", 3: "rx", 4: "ry", 2: "l2", 5: "r2"}
+AXES = {0: "lx", 1: "ly", 3: "rx", 4: "ry", 2: "l2", 5: "r2", 9: "r2", 10: "l2"}   # standard layout
+ALT_AXES = {0: "lx", 1: "ly", 2: "rx", 5: "ry", 9: "r2", 10: "l2"}              # right stick on Z/RZ
+DIGITAL_TRIGGERS = {312: "l2", 313: "r2"}
 INVERT = {"ly", "ry"}                     # stick up = +1
 TRIGGERS = {"l2", "r2"}
 BUTTONS = {304: "cross", 305: "circle", 307: "triangle", 308: "square", 310: "l1", 311: "r1",
@@ -35,6 +41,7 @@ class PadState:
         self.axes = {a: 0.0 for a in AXES.values()}
         self.held: set[str] = set()
         self.ranges: dict[int, tuple[int, int]] = {}
+        self.map = dict(AXES)
 
     def reset(self):
         with self.lock:
@@ -47,8 +54,8 @@ class PadState:
 
     def event(self, etype: int, code: int, value: int):
         """Apply one input event. Returns a button name on a button PRESS, else None."""
-        if etype == EV_ABS and code in AXES:
-            name = AXES[code]
+        if etype == EV_ABS and code in self.map:
+            name = self.map[code]
             lo, hi = self.ranges.get(code, (0, 255))
             if name in TRIGGERS:
                 v = (value - lo) / max(1, hi - lo)
@@ -59,6 +66,9 @@ class PadState:
                     v = -v
             with self.lock:
                 self.axes[name] = max(-1.0, min(1.0, v))
+        elif etype == EV_KEY and code in DIGITAL_TRIGGERS:
+            with self.lock:
+                self.axes[DIGITAL_TRIGGERS[code]] = 1.0 if value else 0.0
         elif etype == EV_KEY and code in BUTTONS:
             name = BUTTONS[code]
             with self.lock:
@@ -80,10 +90,11 @@ def _find_device():
             continue
         caps = d.capabilities()
         abs_codes = {c if isinstance(c, int) else c[0] for c in caps.get(EV_ABS, [])}
-        if {0, 1, 3, 4} <= abs_codes and 304 in caps.get(EV_KEY, []):
-            return d
+        keys = set(caps.get(EV_KEY, []))
+        if {0, 1} <= abs_codes and keys & {304, 305} and ({3, 4} <= abs_codes or {2, 5} <= abs_codes):
+            return d, (AXES if {3, 4} <= abs_codes else ALT_AXES)
         d.close()
-    return None
+    return None, None
 
 
 class Gamepad:
@@ -110,7 +121,7 @@ class Gamepad:
         while self.alive:
             dev = None
             try:
-                dev = _find_device()
+                dev, layout = _find_device()
             except Exception as e:  # noqa: BLE001
                 msg = f"🎮 can't read controllers ({e}) - is the user in the 'input' group?"
                 if msg != last_msg:
@@ -122,7 +133,8 @@ class Gamepad:
                     self.on_status(last_msg)
                 time.sleep(2)
                 continue
-            for code in AXES:
+            self.state.map = dict(layout)
+            for code in layout:
                 try:
                     info = dev.absinfo(code)
                     self.state.ranges[code] = (info.min, info.max)
@@ -151,3 +163,41 @@ class Gamepad:
             last_msg = "🎮 controller disconnected - arm stopped. Reconnect it to continue."
             self.on_status(last_msg)
             time.sleep(1)
+
+
+def _diagnose():
+    """python3 gamepad.py  ->  list input devices, then show the controller live (Ctrl+C to quit)."""
+    try:
+        import evdev  # noqa: PLC0415
+    except ImportError:
+        raise SystemExit("evdev missing - run: sudo apt install python3-evdev")
+    print("input devices:")
+    for p in evdev.list_devices():
+        try:
+            d = evdev.InputDevice(p)
+            print(f"  {p}  {d.name}")
+        except OSError as e:
+            print(f"  {p}  (can't open: {e} - add yourself to the 'input' group and log in again)")
+    dev, layout = _find_device()
+    if dev is None:
+        raise SystemExit("\nNo gamepad found. Is it plugged in / paired? If it isn't listed above at all,\n"
+                         "the Pi can't see it (some phone-only controllers never show up on Linux).")
+    print(f"\nusing: {dev.name}  ({'standard' if layout is AXES else 'Z/RZ right-stick'} layout)\n"
+          "move the sticks / press buttons - Ctrl+C to quit\n")
+    st = PadState()
+    st.map = dict(layout)
+    for code in layout:
+        try:
+            i = dev.absinfo(code)
+            st.ranges[code] = (i.min, i.max)
+        except Exception:  # noqa: BLE001
+            pass
+    for ev in dev.read_loop():
+        b = st.event(ev.type, ev.code, ev.value)
+        a, held = st.snapshot()
+        line = "  ".join(f"{k}{v:+.2f}" for k, v in a.items()) + "  " + " ".join(sorted(held))
+        print(("PRESS " + b + "   " if b else "") + line + " " * 10, end="\r" if not b else "\n", flush=True)
+
+
+if __name__ == "__main__":
+    _diagnose()

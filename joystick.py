@@ -23,7 +23,7 @@ PAD = 210            # canvas size, px
 R = 80               # stick travel radius, px
 KNOB = 24
 DEAD = 0.12          # dead zone (fraction of full deflection)
-TICK_S = 0.05        # 20 Hz, same as the slider streamer
+TICK_S = 0.025       # 40 Hz, same as the slider streamer
 GRIP_SPEED = 400     # ticks/s while OPEN / CLOSE is held
 KEYS = {"a": (1, -1), "d": (1, 1), "w": (2, 1), "s": (2, -1),
         "j": (4, -1), "l": (4, 1), "i": (3, 1), "k": (3, -1)}
@@ -257,7 +257,10 @@ class DrivePanel:
                 base = app.svar[j].get() if recent or j not in app.pos else app.pos[j]
             t = base + v * TICK_S
             if j in app.pos:                           # never run far ahead of the real arm
-                lead = max(60.0, abs(v) * 0.3)
+                # the reading can be ~0.3 s old: allow for how far the arm has moved since,
+                # otherwise a fast push gets throttled and feels laggy
+                age = min(1.0, time.monotonic() - app.pos_t)
+                lead = max(80.0, abs(v) * (0.25 + age))
                 t = max(app.pos[j] - lead, min(app.pos[j] + lead, t))
             lo, hi = app._limits(j)
             t = max(lo, min(hi, t))

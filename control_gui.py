@@ -42,7 +42,7 @@ ST = {"saved": "✓", "ready": "●", "todo": "○"}
 SLIDER_SPEEDS = {"gentle": (200, 15), "normal": (450, 35), "fast": (900, 80)}
 SERVO_TOP_SPEED = 3000  # ST3215 real-world top speed, ticks/s
 GRIP_RAMP = 500         # ticks/s - same speed the grip buttons move the gripper at
-SLIDER_HZ = 20          # max rate slider targets are sent to the servos
+SLIDER_HZ = 40          # max rate slider / stick targets are sent (one no-reply packet each)
 TOUCH_HOLD_S = 1.5      # after you touch a slider it stops following the live reading this long
 
 
@@ -63,6 +63,7 @@ class App(tk.Tk):
         self.running = False
         self.alive = True
         self.pos: dict[int, int] = {}
+        self.pos_t = 0.0                     # when self.pos was read
 
         # game state
         self.board = {c: None for c in CELLS}
@@ -362,6 +363,7 @@ class App(tk.Tk):
             elif kind == "pos":
                 val, faults = val
                 self.pos = val
+                self.pos_t = time.monotonic()
                 now = time.monotonic()
                 for j, v in val.items():
                     if self._grab.get(j) is None and now - self.touched.get(j, 0) > TOUCH_HOLD_S:
@@ -393,7 +395,7 @@ class App(tk.Tk):
         if self.started and self.t0:
             left = max(0, GAME_SECONDS - int(time.monotonic() - self.t0))
             self.timer.config(text=f"{left // 60}:{left % 60:02d}", fg="red" if left < 30 else "black")
-        self.after(80, self._pump)
+        self.after(30, self._pump)
 
     def run(self, fn, *a, after=None, game=False):
         if game and not self.started:
@@ -544,7 +546,7 @@ class App(tk.Tk):
                 continue
             speed, acc = self._spd
             if self._joy_speed:                   # joystick: servo must keep up with the stick
-                speed, acc = max(speed, int(self._joy_speed * 1.5)), max(acc, 80)
+                speed, acc = max(speed, int(self._joy_speed * 1.5)), max(acc, 200)   # crisp start/stop
             now = time.monotonic()
             try:
                 for j in pending:
