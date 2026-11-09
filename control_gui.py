@@ -79,6 +79,7 @@ class App(tk.Tk):
         self.goal_lock = threading.Lock()
         self.touched: dict[int, float] = {}
         self._grab: dict[int, float | None] = {}
+        self._sync_ok: bool | None = None       # SYNC READ supported? (None = not tried yet)
         self.slider_owned: set[int] = set()   # joints whose latest command came from a slider
         self._backed_off: set[int] = set()
         self._build()
@@ -268,8 +269,9 @@ class App(tk.Tk):
         tk.Button(fb, text="Discard fluid (use waypoints)", command=self.discard_fluid).pack(side="left", padx=2)
         tk.Label(ff, text=("The arm goes to the scenario's start pose and goes LIMP. Move it through the whole "
                            "scenario (use the gripper buttons on the left for grab / release), end at SAFE, "
-                           "press ■ Stop. It is cleaned automatically: shake smoothed, pauses shortened, "
-                           "ends snapped to SAFE. Without a fluid take, the waypoints play as a smooth curve."),
+                           "press ■ Stop. It is saved EXACTLY as you moved it (no smoothing, trimming or "
+                           "snapping) and plays back the same way. Without a fluid take, the waypoints "
+                           "play as a smooth curve."),
                  fg="#555", wraplength=560, justify="left").pack(anchor="w")
 
     def _build_game(self):
@@ -632,8 +634,9 @@ class App(tk.Tk):
         fl = sc.fluid_path(name, self.traj_folder)
         if fl.exists():
             rep = json.loads(fl.read_text()).get("roboarm", {}).get("report", {})
-            self.motion_lbl.config(text=f"plays: ● FLUID TAKE ({rep.get('clean_duration_s', '?')} s, hand-recorded)",
-                                   fg="#15803d")
+            dur = rep.get("duration_s", rep.get("clean_duration_s", "?"))
+            how = (f"exact, {rep['hz']} Hz" if "hz" in rep else "OLD CLEANED take - re-record it")
+            self.motion_lbl.config(text=f"plays: ● FLUID TAKE ({dur} s, {how})", fg="#15803d")
         elif not self.data.missing(name):
             self.motion_lbl.config(text="plays: smooth curve through the waypoints", fg="#1d4ed8")
         else:
@@ -708,7 +711,7 @@ class App(tk.Tk):
         self.arm.log(f"  ▶ {name} ({src}, {tr.duration / rate:.1f} s at ×{rate:g})")
         self.arm.torque(True)
         last_g = int(round(tr.q[-1][GRIPPER]))
-        trajectory.play(self.arm, tr, rate=rate, hz=self.arm.cfg.get("stream_hz", 40),
+        trajectory.play(self.arm, tr, rate=rate, hz=self.arm.cfg.get("stream_hz", 50),
                         ignore_gripper=last_g in self.data.closed_values(), log=self.arm.log)
         return True
 
@@ -723,7 +726,7 @@ class App(tk.Tk):
     def toggle_fluid(self):
         if self.recording and self.rec_stop is not None:
             self.rec_stop.set()
-            self.rec_btn.config(text="… cleaning")
+            self.rec_btn.config(text="… saving")
             return
         name = self.selected()
         if not name:
@@ -752,18 +755,22 @@ class App(tk.Tk):
                 log(f"  {k}…")
             time.sleep(0.7)
             log("  ● RECORDING - move through the scenario, end at SAFE, press ■ Stop")
-            raw = trajectory.record(self.arm.read_all, self.rec_stop, hz=25,
-                                    on_sample=lambda n, t: n % 5 == 0 and self.q.put(("rec", (n, t))))
+            hz = self.arm.cfg.get("record_hz", 50)
+            raw = trajectory.record(self._read_fast, self.rec_stop, hz=hz,
+                                    on_sample=lambda n, t: n % 10 == 0 and self.q.put(("rec", (n, t))))
             cur = self.arm.read_all()
             self.arm.bus.sync_write_positions({j: (cur[j], 150, 20) for j in JOINT_IDS})
             self.arm.torque(True)
+            if len(raw) < 2:
+                raise ValueError("recording too short - nothing saved")
+            # saved exactly as recorded: no smoothing, trimming, pause-shortening or snapping
+            got = round((len(raw) - 1) / raw.duration, 1) if raw.duration else 0
+            rep = {"duration_s": round(raw.duration, 2), "samples": len(raw), "hz": got, "cleaned": False}
             trajectory.save_raw(self.traj_folder / "raw" / f"{name}.json", raw)
-            tr, rep = trajectory.clean(raw, start, end)
-            trajectory.save(sc.fluid_path(name, self.traj_folder), tr, name,
-                            f"roboarm fluid take: {name}", self.names, extra={"report": rep})
-            log(f"  ✓ cleaned: {rep['raw_duration_s']} s recorded → {rep['clean_duration_s']} s "
-                f"(trimmed {rep['trimmed_s']} s, pauses -{rep['pauses_removed_s']} s, "
-                f"{rep['grip_events']} gripper events). Press ▶ Test.")
+            trajectory.save(sc.fluid_path(name, self.traj_folder), raw, name,
+                            f"roboarm fluid take (exact): {name}", self.names, extra={"report": rep})
+            log(f"  ✓ saved exactly as recorded: {rep['duration_s']} s, {len(raw)} samples "
+                f"({got} Hz{', bus is the limit' if got < 0.9 * hz else ''}). Press ▶ Test.")
         except EStop:
             log("stopped by E-STOP - recording discarded")
         except Exception as e:  # noqa: BLE001
@@ -772,6 +779,21 @@ class App(tk.Tk):
             self.recording = False
             self.rec_stop = None
             self.q.put(("done", done))
+
+    def _read_fast(self):
+        """One recording sample: SYNC READ (all 5 joints in one round trip) if the bus supports
+        it, else the 5 single reads."""
+        if self._sync_ok is not False:
+            try:
+                r = self.arm.bus.sync_read_positions(JOINT_IDS)
+                self._sync_ok = True
+                return r
+            except ServoError:
+                if self._sync_ok:            # worked before: just a dropped sample
+                    raise
+                self._sync_ok = False
+                self.q.put(("log", "  (this bus has no SYNC READ - reading the 5 servos one by one)"))
+        return self.arm.read_all()
 
     def discard_fluid(self):
         name = self.selected()

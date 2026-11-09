@@ -42,7 +42,8 @@ The official repo is found automatically at `~/robot-arm-lab/STS3215-5DOF-Robot-
 | File | Contents |
 |---|---|
 | `control_gui.py` | The GUI described above |
-| `trajectory.py` | Fluid motion: records hand-guided takes, cleans them, turns waypoints into smooth curves, and streams them to the servos |
+| `trajectory.py` | Fluid motion: records hand-guided takes (saved exactly, ~50 Hz), turns waypoints into smooth curves, and streams them to the servos |
+| `restore_raw_takes.py` | One-off: turns old auto-cleaned fluid takes back into the exact original recordings |
 | `clean.py` | Cleans pushed data (limits, missing lifts) and writes `CLEANING_REPORT.md` |
 | `scenarios.py` | The 41 scenario templates, `scenario_data.json`, and saving and loading official waypoint files |
 | `official.py` | Reads the official `arm_settings.py`, converts between raw ticks and angles, and writes waypoint files |

@@ -22,6 +22,7 @@ from dataclasses import dataclass
 INST_PING = 0x01
 INST_READ = 0x02
 INST_WRITE = 0x03
+INST_SYNC_READ = 0x82
 INST_SYNC_WRITE = 0x83
 BROADCAST_ID = 0xFE
 
@@ -234,6 +235,37 @@ class ServoBus:
     def write_position(self, sid: int, pos: int, speed: int, acc: int):
         self.write(sid, ADDR_ACC, goal_block(pos, speed, acc))
 
+    def sync_read_positions(self, ids, timeout: float = DEFAULT_TIMEOUT_S) -> dict[int, int]:
+        """All positions with ONE request (SYNC READ): every servo answers in turn, so a full
+        5-joint sample takes one round trip instead of five. Raises ServoTimeout if any
+        servo is missing (e.g. the bridge doesn't pass SYNC READ) - callers fall back."""
+        ids = list(ids)
+        pkt = build_packet(BROADCAST_ID, INST_SYNC_READ, [ADDR_PRESENT_POSITION, 2, *ids])
+        out: dict[int, int] = {}
+        with self._lock:
+            self._flush()
+            self.ser.write(pkt)
+            deadline = time.monotonic() + timeout
+            while len(out) < len(ids) and time.monotonic() < deadline:
+                chunk = self.ser.read(64)
+                if not chunk:
+                    continue
+                self._rx += chunk
+                while True:
+                    status, self._rx = parse_status(self._rx)
+                    if status is None:
+                        break
+                    if status["raw"] == pkt or status["id"] not in ids or len(status["params"]) != 2:
+                        continue
+                    self.faults[status["id"]] = status["error"]
+                    b = status["params"]
+                    out[status["id"]] = b[0] | (b[1] << 8)
+            if len(out) < len(ids):
+                time.sleep(FLUSH_AFTER_TIMEOUT_S)
+                self._flush()
+                raise ServoTimeout(f"sync read: no reply from {sorted(set(ids) - set(out))}")
+        return out
+
     def sync_write_positions(self, targets: dict[int, tuple[int, int, int]]):
         """Broadcast — servos never reply to SYNC WRITE."""
         self._request(build_sync_write_positions_packet(targets), None, None)
@@ -291,6 +323,14 @@ class MockTransport:
             addr, n = p[0], p[1]
             for k in range(2, len(p), n + 1):
                 self._apply_write(p[k], addr, p[k + 1:k + 1 + n])
+            return
+        if instr == INST_SYNC_READ:
+            addr, n = p[0], p[1]
+            for i in p[2:]:
+                if i in self.servos:
+                    pos = int(round(self.servos[i].pos))
+                    mem = {56: pos & 0xFF, 57: pos >> 8}
+                    self._reply(i, bytes(mem.get(addr + k, 0) for k in range(n)))
             return
         if sid not in self.servos:
             return
