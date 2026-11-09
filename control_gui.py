@@ -96,6 +96,7 @@ class App(tk.Tk):
             self.bind_all(k, lambda e: self._grip_key("open"))
         threading.Thread(target=self._poll, daemon=True).start()
         threading.Thread(target=self._stream, daemon=True).start()
+        threading.Thread(target=self._apply_grip_strength, daemon=True).start()
         self.after(60, self._pump)
         self.refresh_all()
         self.protocol("WM_DELETE_WINDOW", self._close)
@@ -190,6 +191,12 @@ class App(tk.Tk):
         gf.grid(row=26, columnspan=4)
         for g in sc.GRIPS:
             tk.Button(gf, text=g, width=7, command=lambda g=g: self.apply_grip(g)).pack(side="left")
+        self.grip_pct = tk.IntVar(value=self.data.grip_strength)
+        gs = tk.Scale(f, variable=self.grip_pct, from_=20, to=100, resolution=5, orient="horizontal",
+                      length=240, label="grip strength %  (G / grip buttons / playback)")
+        gs.grid(row=28, columnspan=4)
+        gs.bind("<ButtonRelease-1>", lambda e: self.set_grip_strength())
+        gs.bind("<KeyRelease>", lambda e: self.set_grip_strength())
         tk.Label(f, text="LIMP keeps the gripper powered so a held block won't drop.",
                  fg="#555", justify="left").grid(row=27, columnspan=4, pady=6)
 
@@ -521,6 +528,8 @@ class App(tk.Tk):
                     continue
                 try:
                     self.arm.bus.set_torque(j, True)
+                    if j == GRIPPER:
+                        self._apply_grip_strength()
                     self.arm.bus.write_position(j, v, speed, acc)
                     if j == GRIPPER:
                         self.arm.gripper_goal = v
@@ -543,7 +552,7 @@ class App(tk.Tk):
             return self.log(f"grip '{g}' not set yet (tab 1)")
         v = self.data.grips[g]
         self.slider_owned.discard(GRIPPER)
-        act = lambda: (self.arm.bus.set_torque(GRIPPER, True),
+        act = lambda: (self.arm.bus.set_torque(GRIPPER, True), self._apply_grip_strength(),
                        self.arm.move_to({GRIPPER: v}, speed=GRIP_RAMP, ignore=(GRIPPER,)))
         if self.recording:            # grab / release DURING a fluid recording
             self.log(f"  gripper -> {g}")
@@ -551,6 +560,22 @@ class App(tk.Tk):
             threading.Thread(target=act, daemon=True).start()
         else:
             self.run(act)
+
+    def set_grip_strength(self):
+        pct = int(self.grip_pct.get())
+        if pct != self.data.grip_strength:
+            self.data.grip_strength = pct
+            self.data.save()
+            self.log(f"grip strength {pct} %")
+        threading.Thread(target=self._apply_grip_strength, daemon=True).start()
+
+    def _apply_grip_strength(self):
+        """Write the gripper's torque limit (safe from any thread). Re-applied whenever the
+        gripper is powered or commanded, in case the servo reset it."""
+        try:
+            self.arm.bus.set_torque_limit(GRIPPER, self.data.grip_strength * 10)
+        except Exception as e:  # noqa: BLE001
+            self.q.put(("log", f"could not set grip strength: {e}"))
 
     def grab_grip(self):
         """Grip value G uses: the block in the selected scenario (pick_cube -> cube,
@@ -745,6 +770,7 @@ class App(tk.Tk):
             self.arm.log(f"  ⚠ at ×{rate:g} this needs {need:.0f} ticks/s but the servos top out near "
                          f"{SERVO_TOP_SPEED} - the arm will lag behind and cut corners. Try a lower speed.")
         self.arm.torque(True)
+        self._apply_grip_strength()
         last_g = int(round(tr.q[-1][GRIPPER]))
         trajectory.play(self.arm, tr, rate=rate, hz=self.arm.cfg.get("stream_hz", 50),
                         ignore_gripper=last_g in self.data.closed_values(), log=self.arm.log)

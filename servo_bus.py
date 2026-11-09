@@ -28,6 +28,7 @@ BROADCAST_ID = 0xFE
 
 # --- SMS_STS registers (same numbers as scservo.ts) ---------------------------
 ADDR_TORQUE_ENABLE = 40   # 1 on, 0 off, 128 = "set current position as middle (2048)"
+ADDR_TORQUE_LIMIT = 48   # 0..1000 = 0..100 % of max torque (RAM)
 ADDR_ACC = 41             # goal block: acc, posL, posH, timeL, timeH, spdL, spdH
 ADDR_PRESENT_POSITION = 56
 ADDR_PRESENT_LOAD = 60
@@ -234,6 +235,11 @@ class ServoBus:
     def set_torque(self, sid: int, on: bool):
         self.write(sid, ADDR_TORQUE_ENABLE, [1 if on else 0])
 
+    def set_torque_limit(self, sid: int, permille: int):
+        """Cap how hard the servo pushes (1000 = full). Used as the gripper's grip strength."""
+        v = max(0, min(1000, int(permille)))
+        self.write(sid, ADDR_TORQUE_LIMIT, [v & 0xFF, v >> 8])
+
     def write_position(self, sid: int, pos: int, speed: int, acc: int):
         self.write(sid, ADDR_ACC, goal_block(pos, speed, acc))
 
@@ -283,6 +289,7 @@ class _SimServo:
     speed: float = 300
     torque: bool = False
     load: int = 0
+    torque_limit: int = 1000
     err: int = 0          # error bits sent in every reply (tests simulate overload with it)
 
 
@@ -362,6 +369,8 @@ class MockTransport:
             else:
                 s.torque = bool(data[0])
                 s.goal = s.pos
+        elif addr == ADDR_TORQUE_LIMIT:
+            s.torque_limit = data[0] | (data[1] << 8)
         elif addr == ADDR_ACC and s.torque:
             s.goal = data[1] | (data[2] << 8)
             s.speed = data[5] | (data[6] << 8)
