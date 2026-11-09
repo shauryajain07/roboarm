@@ -351,8 +351,9 @@ def play(arm, tr: Traj, rate: float = 1.0, hz: float = 40.0, ignore_gripper: boo
             raise
     period = 1.0 / hz
     t_end = tr.t[-1] / rate
-    # faster playback needs snappier servos: scale acceleration with the rate (capped at max)
-    acc = int(min(cfg.get("max_acc", 254), cfg.get("stream_acc", 150) * max(1.0, rate)))
+    # servos must be able to change speed within one 20 ms tick, or they lag further behind
+    # every tick and the end of the move crawls at slow_speed - so stream at full acceleration
+    acc = int(min(cfg.get("max_acc", 254), max(cfg.get("stream_acc", 254), 1)))
     t0 = time.monotonic()
     prev = tr.at(0)
     while True:
@@ -372,8 +373,15 @@ def play(arm, tr: Traj, rate: float = 1.0, hz: float = 40.0, ignore_gripper: boo
         if tt >= t_end:
             break
         time.sleep(max(0.0, period - ((time.monotonic() - t0) - now)))
-    arm.move_to(tr.rounded(len(tr) - 1), speed=cfg["slow_speed"],
-                ignore=(GRIPPER,) if ignore_gripper else ())
+    last = tr.rounded(len(tr) - 1)
+    try:                                       # how far behind were the servos at the end?
+        cur = arm.read_all()
+        lag = max(abs(cur[j] - last[j]) for j in ARM_JOINTS)
+        if log and lag > 60:
+            log(f"  ⚠ servos were {lag} ticks behind at the end (×{rate:g} is faster than they can follow)")
+    except Exception:  # noqa: BLE001
+        pass
+    arm.move_to(last, speed=cfg["speed"], ignore=(GRIPPER,) if ignore_gripper else ())
 
 
 # ============================================================================ files

@@ -81,6 +81,7 @@ class App(tk.Tk):
         self.goal_lock = threading.Lock()
         self.touched: dict[int, float] = {}
         self._grab: dict[int, float | None] = {}
+        self._rec_grab = "cube"
         self._rec_grip: int | None = None       # gripper value COMMANDED during a fluid recording
         self._sync_ok: bool | None = None       # SYNC READ supported? (None = not tried yet)
         self.slider_owned: set[int] = set()   # joints whose latest command came from a slider
@@ -88,6 +89,11 @@ class App(tk.Tk):
         self._build()
         for k in ("<space>", "<Escape>"):
             self.bind_all(k, lambda e: self.estop())
+        # one-handed gripper while you guide the arm: G = grab with this scenario's block, O = open
+        for k in ("<g>", "<G>"):
+            self.bind_all(k, lambda e: self._grip_key("grab"))
+        for k in ("<o>", "<O>"):
+            self.bind_all(k, lambda e: self._grip_key("open"))
         threading.Thread(target=self._poll, daemon=True).start()
         threading.Thread(target=self._stream, daemon=True).start()
         self.after(60, self._pump)
@@ -276,7 +282,7 @@ class App(tk.Tk):
         self.rec_btn.pack(side="left", padx=2)
         tk.Button(fb, text="Discard fluid (use waypoints)", command=self.discard_fluid).pack(side="left", padx=2)
         tk.Label(ff, text=("The arm goes to the scenario's start pose and goes LIMP. Move it through the whole "
-                           "scenario (use the gripper buttons on the left for grab / release), end at SAFE, "
+                           "scenario - press G to grab and O to open (or use the gripper buttons), end at SAFE, "
                            "press ■ Stop. It is saved EXACTLY as you moved it (no smoothing, trimming or "
                            "snapping) and plays back the same way. Without a fluid take, the waypoints "
                            "play as a smooth curve."),
@@ -546,6 +552,20 @@ class App(tk.Tk):
         else:
             self.run(act)
 
+    def grab_grip(self):
+        """Grip value G uses: the block in the selected scenario (pick_cube -> cube,
+        place_trophy_r1c2 -> trophy, attack_* -> attack), else the Game tab's block."""
+        kind, _, rest = (self.selected() or "").partition("_")
+        if kind == "attack":
+            return "attack"
+        b = rest.split("_")[0] if kind in ("pick", "place") else ""
+        return b if b in BLOCKS else self.block.get()
+
+    def _grip_key(self, what):
+        if isinstance(self.focus_get(), (tk.Text, tk.Entry)):
+            return                               # typing, not a command
+        self.apply_grip("open" if what == "open" else self.grab_grip())
+
     def goto(self, pose, label="pose"):
         if not pose:
             return self.log(f"{label} not recorded yet")
@@ -752,6 +772,7 @@ class App(tk.Tk):
             return self.log("set the shared poses and gripper values in tab 1 first")
         if self.running:
             return self.log("busy - wait for the current move to finish")
+        self._rec_grab = self.grab_grip()        # Tk read: here, not in the worker thread
         self.running = self.recording = True
         self.rec_stop = threading.Event()
         threading.Thread(target=self._record_fluid, args=(name, start, end), daemon=True).start()
@@ -770,7 +791,8 @@ class App(tk.Tk):
                 log(f"  {k}…")
             time.sleep(0.7)
             self._rec_grip = int(start[GRIPPER])
-            log("  ● RECORDING - move through the scenario, end at SAFE, press ■ Stop")
+            log(f"  ● RECORDING - move through the scenario, end at SAFE, press ■ Stop.  "
+                f"Keys: G = grab ({self._rec_grab}), O = open")
             hz = self.arm.cfg.get("record_hz", 100)
             raw = trajectory.record(self._read_fast, self.rec_stop, hz=hz,
                                     on_sample=lambda n, t: n % 10 == 0 and self.q.put(("rec", (n, t))))

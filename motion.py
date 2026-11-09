@@ -34,7 +34,8 @@ DEFAULT_CONFIG = {
     "fluid_speed": 1100,     # peak ticks/s of smooth (fluid) playback; GUI slider scales it
     "stream_hz": 50,         # how often fluid playback updates the servo targets
     "record_hz": 100,        # target samples/s for fluid takes (the bus decides what's reached)
-    "stream_acc": 150,       # servo acceleration while streaming
+    "stream_acc": 254,       # servo acceleration while streaming: MAX, so the servo can follow
+                             # 50 targets/s (150 made it crawl and lag, so 2x/4x got slower)
     "glide_waypoints": False,  # True = glide through non-precision waypoints instead of resting at each
     "acc": 30,
     "arrive_tolerance": 15,  # ticks (~1.3 deg)
