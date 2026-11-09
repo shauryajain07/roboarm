@@ -9,7 +9,8 @@ automatically; unplug it and every stick reads zero, so the arm stops.
   L1           open the gripper fully
   hold L2      precision (¼ speed)
   A B X Y      go to that preset pose          hold View + A/B/X/Y = save the arm here
-  Menu (≡)     E-STOP                          tap View = RESET STOP
+  D-pad ↓      E-STOP                          D-pad ↑ = RESET STOP
+  Menu (≡)     E-STOP too                      tap View = RESET STOP too
   L3 (click)   HOLD here                       R3 (click) = CAPTURE the selected pose (tab 2)
 Face buttons are named by POSITION (Xbox layout: A bottom, B right, X left, Y top).
 
@@ -31,7 +32,9 @@ DIGITAL_TRIGGERS = {312: "l2", 313: "r2"}
 INVERT = {"ly", "ry"}                     # stick up = +1
 TRIGGERS = {"l2", "r2"}
 BUTTONS = {304: "a", 305: "b", 307: "y", 308: "x", 310: "l1", 311: "r1",     # face buttons by position
-           314: "view", 315: "menu", 316: "home", 317: "l3", 318: "r3"}
+           314: "view", 315: "menu", 316: "home", 317: "l3", 318: "r3",
+           544: "dpad_up", 545: "dpad_down", 546: "dpad_left", 547: "dpad_right"}  # D-pad as buttons
+HATS = {16: ("dpad_left", "dpad_right"), 17: ("dpad_up", "dpad_down")}         # D-pad as a hat axis
 
 
 class PadState:
@@ -43,6 +46,7 @@ class PadState:
         self.held: set[str] = set()
         self.ranges: dict[int, tuple[int, int]] = {}
         self.map = dict(AXES)
+        self.hat: dict[int, int] = {}
 
     def reset(self):
         with self.lock:
@@ -55,6 +59,20 @@ class PadState:
 
     def event(self, etype: int, code: int, value: int):
         """Apply one input event. Returns 'name' on a button press, '-name' on a release."""
+        if etype == EV_ABS and code in HATS:          # D-pad: -1 / 0 / +1
+            prev, self.hat[code] = self.hat.get(code, 0), value
+            neg, pos = HATS[code]
+            if value and value != prev:
+                name = neg if value < 0 else pos
+                with self.lock:
+                    self.held.add(name)
+                return name
+            if not value and prev:
+                name = neg if prev < 0 else pos
+                with self.lock:
+                    self.held.discard(name)
+                return "-" + name
+            return None
         if etype == EV_ABS and code in self.map:
             name = self.map[code]
             lo, hi = self.ranges.get(code, (0, 255))

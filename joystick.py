@@ -103,7 +103,7 @@ class DrivePanel:
                                 fg="#1d4ed8")
         self.pad_lbl.pack(anchor="w", pady=(6, 0))
         tk.Label(parent, text=("Controller: sticks as below · R1 gentle close · L1 open · hold L2 precise · "
-                               "A B X Y presets (hold View + button to save) · Menu E-STOP · View reset · "
+                               "A B X Y presets (hold View + button to save) · D-pad ↓ E-STOP · D-pad ↑ reset · "
                                "L3 HOLD · R3 CAPTURE"),
                  fg="#555", wraplength=640, justify="left").pack(anchor="w")
         tk.Label(parent, text=("Push a stick: the further you push, the faster that joint moves. "
@@ -190,7 +190,7 @@ class DrivePanel:
 
     def _pad_button(self, name):
         """Controller thread. E-STOP goes straight out - no waiting for the GUI loop."""
-        if name == "menu":
+        if name in ("dpad_down", "menu"):            # E-STOP: straight out, no GUI wait
             self.app.estop()
         else:
             self.app.q.put(("pad_btn", name))
@@ -207,7 +207,7 @@ class DrivePanel:
                 self._view_used = True
                 return app.save_preset(name)
             return app.go_preset(name)
-        act = {"l3": app.hold, "r3": app.capture,
+        act = {"dpad_up": app.reset_stop, "l3": app.hold, "r3": app.capture,
                "r1": app.close_gently, "l1": app.open_full}.get(name)
         if act:
             app.log(f"🎮 {name.upper()}")
