@@ -6,7 +6,8 @@
   Shift (or the 'precise' box) = quarter speed for lining up a grab.
 
 Velocity control: how far you push a stick = how fast that joint moves; let go and it stops
-where it is. Mouse drives one stick while the keyboard drives the other, so two joints (or
+where it is. Push diagonally to move both of that stick's joints at once (within ~10 deg of
+straight it moves just one). Mouse drives one stick while the keyboard drives the other, so two joints (or
 all four) can move together. Everything goes through the slider system, so joint limits,
 E-STOP, jam back-off and grip strength still apply.
 """
@@ -16,7 +17,7 @@ import threading
 import time
 import tkinter as tk
 
-from gamepad import Gamepad
+from gamepad import DEAD, Gamepad, curve, stick  # noqa: F401 - curve kept for importers
 from poses import GRIPPER, JOINT_NAMES
 
 NEVER = float("-inf")
@@ -24,21 +25,11 @@ NEVER = float("-inf")
 PAD = 210            # canvas size, px
 R = 80               # stick travel radius, px
 KNOB = 24
-DEAD = 0.12          # dead zone (fraction of full deflection)
 TICK_S = 0.025       # 40 Hz, same as the slider streamer
 GRIP_SPEED = 400     # ticks/s while OPEN / CLOSE (or L1 / R1) is held
 GRIP_SQUEEZE = 20    # max ticks past the point where the jaws stopped on something
 KEYS = {"a": (1, -1), "d": (1, 1), "w": (2, 1), "s": (2, -1),
         "j": (4, -1), "l": (4, 1), "i": (3, 1), "k": (3, -1)}
-
-
-def curve(d: float) -> float:
-    """Deflection -1..1 -> speed -1..1: dead zone, then squared for fine control near centre."""
-    a = abs(d)
-    if a < DEAD:
-        return 0.0
-    u = min(1.0, (a - DEAD) / (1 - DEAD))
-    return u * u * (1 if d > 0 else -1)
 
 
 class Pad:
@@ -272,18 +263,23 @@ class DrivePanel:
 
     def _speeds(self) -> dict[int, float]:
         vel: dict[int, float] = {}
-        for p in self.pads:
-            for j, d in ((p.x_joint, p.dx), (p.y_joint, p.dy)):
-                if curve(d):
-                    vel[j] = vel.get(j, 0.0) + curve(d)
+
+        def add(j, v):
+            if v:
+                vel[j] = vel.get(j, 0.0) + v
+        for p in self.pads:                           # diagonal push = both joints, in proportion
+            vx, vy = stick(p.dx, p.dy)
+            add(p.x_joint, vx)
+            add(p.y_joint, vy)
         if self.visible():
             for k in self.held:
                 j, s = KEYS[k]
-                vel[j] = vel.get(j, 0.0) + s
+                add(j, s)
         axes, _ = self.pad.state.snapshot()           # controller: same layout as the pads
-        for j, a in ((1, "lx"), (2, "ly"), (4, "rx"), (3, "ry")):
-            if curve(axes[a]):
-                vel[j] = vel.get(j, 0.0) + curve(axes[a])
+        for (jx, ax), (jy, ay) in (((1, "lx"), (2, "ly")), ((4, "rx"), (3, "ry"))):
+            vx, vy = stick(axes[ax], axes[ay])
+            add(jx, vx)
+            add(jy, vy)
         out = {}
         for j, v in vel.items():
             v = max(-1.0, min(1.0, v)) * (-1 if self.flip[j].get() else 1)

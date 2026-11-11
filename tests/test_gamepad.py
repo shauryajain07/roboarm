@@ -3,6 +3,7 @@
 The SCUF NOMAD codes below are what Linux's generic HID driver reports for it, worked out from
 its HID descriptor and a press-every-button test on the real pad.
 """
+import math
 import os
 import sys
 import types
@@ -83,6 +84,37 @@ class Nomad(unittest.TestCase):
         self.assertEqual(st.inputs, 2)
         st.reset()
         self.assertEqual(st.inputs, 0)
+
+
+class Stick(unittest.TestCase):
+    def test_centre_and_dead_zone(self):
+        self.assertEqual(g.stick(0, 0), (0.0, 0.0))
+        self.assertEqual(g.stick(0.08, 0.05), (0.0, 0.0))
+
+    def test_straight_push_is_one_joint(self):
+        self.assertEqual(g.stick(1, 0), (1.0, 0.0))
+        self.assertEqual(g.stick(0, -1), (0.0, -1.0))
+
+    def test_near_straight_snaps_to_one_joint(self):
+        vx, vy = g.stick(math.cos(math.radians(5)), math.sin(math.radians(5)))
+        self.assertEqual(vy, 0.0)
+        self.assertAlmostEqual(vx, 1.0, places=3)
+
+    def test_diagonal_moves_both_joints(self):
+        vx, vy = g.stick(math.cos(math.radians(45)), math.sin(math.radians(45)))
+        self.assertAlmostEqual(vx, vy, places=6)
+        self.assertGreater(vx, 0.65)                 # was 0.45 each with per-axis shaping
+        vx, vy = g.stick(math.cos(math.radians(30)), -math.sin(math.radians(30)))
+        self.assertGreater(-vy, 0.45)                # was 0.19 - "only one joint moves"
+        self.assertAlmostEqual(vx / -vy, math.sqrt(3), places=3)   # same direction as the push
+
+    def test_square_gate_corner_is_capped(self):
+        vx, vy = g.stick(1, 1)                       # pads that report (1, 1) in the corner
+        self.assertAlmostEqual(math.hypot(vx, vy), 1.0, places=6)
+
+    def test_half_push_is_gentle(self):
+        vx, vy = g.stick(0.35, 0.35)
+        self.assertLess(math.hypot(vx, vy), 0.2)
 
 
 class DefaultLayout(unittest.TestCase):

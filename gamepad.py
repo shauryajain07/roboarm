@@ -24,8 +24,40 @@ Needs:  sudo apt install python3-evdev   (the Pi user must be in the 'input' gro
 """
 from __future__ import annotations
 
+import math
 import threading
 import time
+
+DEAD = 0.12          # stick dead zone (fraction of full deflection)
+SNAP = 0.17          # sin(~10 deg): pushes this close to straight move one joint only
+
+
+def curve(d: float) -> float:
+    """Deflection -1..1 -> speed -1..1: dead zone, then squared for fine control near centre."""
+    a = abs(d)
+    if a < DEAD:
+        return 0.0
+    u = min(1.0, (a - DEAD) / (1 - DEAD))
+    return u * u * (1 if d > 0 else -1)
+
+
+def stick(dx: float, dy: float) -> tuple[float, float]:
+    """One stick's deflection -> (x speed, y speed), each -1..1.
+
+    The dead zone and squared response apply to how FAR the stick is pushed, and that speed is
+    split along the push direction - so a diagonal moves both joints in proportion. (Shaping
+    each axis on its own squashed the smaller one: 30 deg off straight gave it only 19 %.)
+    Pushes within ~10 deg of straight snap to one joint, so single-joint moves stay clean."""
+    m = math.hypot(dx, dy)
+    if m < DEAD:
+        return 0.0, 0.0
+    s = curve(min(m, 1.0)) / m
+    vx, vy = dx * s, dy * s
+    if abs(dy) < SNAP * m:
+        vx, vy = math.copysign(math.hypot(vx, vy), dx), 0.0
+    elif abs(dx) < SNAP * m:
+        vx, vy = 0.0, math.copysign(math.hypot(vx, vy), dy)
+    return vx, vy
 
 # Linux input event codes (numbers, so the mapping can be tested without evdev installed)
 EV_KEY, EV_ABS = 1, 3
