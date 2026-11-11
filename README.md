@@ -37,6 +37,21 @@ python control_gui.py                                   # real arm
 
 The official repo is found automatically at `~/robot-arm-lab/STS3215-5DOF-Robot-Arm`. If it's somewhere else, set `ROBOARM_OFFICIAL=/path/to/it`. To override a setting just for our code, put it in `arm_config.json`.
 
+### Calibrate the gripper
+
+If the gripper shows fully open or closed but the jaws aren't, its zero isn't calibrated. Close the GUI and run:
+
+```bash
+python calibrate.py --check    # what's wrong, changes nothing
+python calibrate.py            # open the jaws by hand, close them, done (~30 s)
+```
+
+Only the gripper's torque is released. It writes the gripper's `ZERO_TICKS`, `DIRECTIONS` and `ANGLE_LIMITS` into the official `arm_settings.py`, after backing it up to `backups/`. It also checks joints 1–4: a recorded pose sitting on a limit means that joint was stopped by its limit.
+
+### Game controller
+
+Plug in or pair a controller and it shows up on the **4 Drive** tab. Its status line shows live stick values. If they don't change when you move the sticks, run `python gamepad.py` to see what the Pi receives. The SCUF NOMAD has its own button map. Use Menu ≡ for E-STOP and tap View to reset; its D-pad isn't used, because Linux misreads it.
+
 ## Files
 
 | File | Contents |
@@ -47,6 +62,8 @@ The official repo is found automatically at `~/robot-arm-lab/STS3215-5DOF-Robot-
 | `clean.py` | Cleans pushed data (limits, missing lifts) and writes `CLEANING_REPORT.md` |
 | `scenarios.py` | The 41 scenario templates, `scenario_data.json`, and saving and loading official waypoint files |
 | `official.py` | Reads the official `arm_settings.py`, converts between raw ticks and angles, and writes waypoint files |
+| `calibrate.py` | Gripper calibration (writes the official `arm_settings.py`) and a check of every joint's limits |
+| `gamepad.py`, `joystick.py` | Game controller reader with per-pad button maps, and the **4 Drive** tab |
 | `motion.py` | Synchronised moves (all joints arrive together), joint limits, E-stop and grip detection |
 | `servo_bus.py` | The ST3215 serial driver (same bytes as the course tools), plus a simulated arm |
 | `strategy.py` | Suggests a placement (win, block, then the best open line) or an attack target |
