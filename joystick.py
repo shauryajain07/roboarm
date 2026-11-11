@@ -106,9 +106,13 @@ class DrivePanel:
         self.pad_lbl = tk.Label(parent, text="🎮 looking for a controller…", font=("Arial", 11, "bold"),
                                 fg="#1d4ed8")
         self.pad_lbl.pack(anchor="w", pady=(6, 0))
+        self.pad_live = tk.Label(parent, text="", font=("Courier", 10), fg="#555", anchor="w",
+                                 wraplength=640, justify="left")
+        self.pad_live.pack(anchor="w")
+        self._ticks = 0
         tk.Label(parent, text=("Controller: sticks as below · hold R1 close · hold L1 open · hold L2 precise · "
-                               "A B X Y presets (hold View + button to save) · D-pad ↓ E-STOP · D-pad ↑ reset · "
-                               "L3 HOLD · R3 CAPTURE"),
+                               "A B X Y presets (hold View + button to save) · Menu ≡ or D-pad ↓ E-STOP · "
+                               "tap View or D-pad ↑ reset · L3 HOLD · R3 CAPTURE"),
                  fg="#555", wraplength=640, justify="left").pack(anchor="w")
         tk.Label(parent, text=("Push a stick: the further you push, the faster that joint moves. "
                                "Let go: it stops. Mouse = one stick, keyboard = the other."),
@@ -235,9 +239,36 @@ class DrivePanel:
     def _tick(self):
         try:
             self._step()
+            self._ticks += 1
+            if self._ticks % 8 == 0:                   # ~5 Hz is plenty for a readout
+                self._show_pad()
         finally:
             if self.app.alive:
                 self.app.after(int(TICK_S * 1000), self._tick)
+
+    def _show_pad(self):
+        """Live line under the controller status: is input arriving, and is anything blocking it?"""
+        p = self.pad
+        if not p.connected:
+            self.pad_live.config(text="")
+            return
+        if not p.state.inputs:
+            self.pad_live.config(fg="#b91c1c", text=(
+                "no input from the controller yet - move a stick. If this stays, the Pi isn't receiving "
+                "its data: close this app and run  python3 gamepad.py  to see what arrives."))
+            return
+        axes, held = p.state.snapshot()
+        txt = (f"L {axes['lx']:+.2f} {axes['ly']:+.2f}   R {axes['rx']:+.2f} {axes['ry']:+.2f}   "
+               f"L2 {axes['l2']:.0f} R2 {axes['r2']:.0f}   {' '.join(sorted(held))}")
+        if self.app.arm.estop.is_set():
+            txt, fg = txt + "\n⛔ E-STOP is on - sticks do nothing until RESET STOP (or tap View)", "#b91c1c"
+        elif self.app.recording:
+            txt, fg = txt + "\nfluid recording - only the gripper follows the controller", "#b45309"
+        elif self.app.running:
+            txt, fg = txt + "\nbusy - a scripted move owns the arm until it finishes", "#b45309"
+        else:
+            fg = "#555"
+        self.pad_live.config(text=txt, fg=fg)
 
     def _speeds(self) -> dict[int, float]:
         vel: dict[int, float] = {}

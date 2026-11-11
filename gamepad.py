@@ -15,7 +15,10 @@ automatically; unplug it and every stick reads zero, so the arm stops.
 Face buttons are named by POSITION (Xbox layout: A bottom, B right, X left, Y top).
 
 Handles the common Linux layouts: right stick on RX/RY or Z/RZ, triggers on Z/RZ,
-GAS/BRAKE or as plain buttons.
+GAS/BRAKE or as plain buttons. Pads that don't fit get an entry in PROFILES:
+  SCUF NOMAD - D-pad is NOT used (Linux misreads it). E-STOP = Menu (≡), RESET = tap View.
+
+`python3 gamepad.py` shows what the Pi actually receives from the controller.
 
 Needs:  sudo apt install python3-evdev   (the Pi user must be in the 'input' group - it is by default)
 """
@@ -36,6 +39,24 @@ BUTTONS = {304: "a", 305: "b", 307: "y", 308: "x", 310: "l1", 311: "r1",     # f
            544: "dpad_up", 545: "dpad_down", 546: "dpad_left", 547: "dpad_right"}  # D-pad as buttons
 HATS = {16: ("dpad_left", "dpad_right"), 17: ("dpad_up", "dpad_down")}         # D-pad as a hat axis
 
+# Controllers whose Linux codes don't follow the usual layout, by (vendor, product) ID.
+# Codes are what Linux's generic HID driver reports, worked out from the pad's HID descriptor
+# and a press-every-button test.
+PROFILES = {
+    (0x1B1C, 0x3A01): {          # SCUF NOMAD mobile controller (Bluetooth, an iPhone "MFi" pad)
+        "name": "SCUF NOMAD",
+        "axes": ALT_AXES,         # right stick on Z / Rz
+        "buttons": {304: "a", 305: "b", 306: "x", 307: "y", 308: "l1", 309: "r1",
+                    312: "l3", 313: "r3",
+                    174: "menu", 130: "view", 172: "home"},   # these three arrive as KEY_EXIT/PROPS/HOMEPAGE
+        "triggers": {310: "l2", 311: "r2"},  # analog in the pad, but Linux reports them as plain keys
+        # Its D-pad is 4 separate bits; Linux's generic driver turns only the first (up) into a
+        # hat and drops the rest, so the D-pad would read as stuck "up" - and "up" = RESET STOP.
+        "hats": False,
+    },
+}
+DEFAULT_PROFILE = {"name": None, "axes": None, "buttons": BUTTONS, "triggers": DIGITAL_TRIGGERS, "hats": True}
+
 
 class PadState:
     """Latest stick / trigger / button state, normalised: sticks -1..1, triggers 0..1."""
@@ -46,12 +67,25 @@ class PadState:
         self.held: set[str] = set()
         self.ranges: dict[int, tuple[int, int]] = {}
         self.map = dict(AXES)
+        self.buttons = dict(BUTTONS)
+        self.triggers = dict(DIGITAL_TRIGGERS)
+        self.hats = True
         self.hat: dict[int, int] = {}
+        self.last_input = 0.0                    # monotonic time of the last mapped event
+        self.inputs = 0                          # mapped events since connect
+
+    def configure(self, layout: dict, profile: dict | None = None):
+        """Use this axis layout and (optionally) a controller profile from PROFILES."""
+        p = {**DEFAULT_PROFILE, **(profile or {})}
+        self.map = dict(p["axes"] or layout)
+        self.buttons, self.triggers, self.hats = dict(p["buttons"]), dict(p["triggers"]), p["hats"]
 
     def reset(self):
         with self.lock:
             self.axes = {a: 0.0 for a in AXES.values()}
             self.held = set()
+            self.hat = {}
+            self.inputs = 0
 
     def snapshot(self):
         with self.lock:
@@ -59,7 +93,13 @@ class PadState:
 
     def event(self, etype: int, code: int, value: int):
         """Apply one input event. Returns 'name' on a button press, '-name' on a release."""
+        if (etype == EV_ABS and code in self.map) or (etype == EV_KEY and (code in self.buttons
+                                                                         or code in self.triggers)):
+            self.last_input = time.monotonic()
+            self.inputs += 1
         if etype == EV_ABS and code in HATS:          # D-pad: -1 / 0 / +1
+            if not self.hats:
+                return None
             prev, self.hat[code] = self.hat.get(code, 0), value
             neg, pos = HATS[code]
             if value and value != prev:
@@ -85,11 +125,13 @@ class PadState:
                     v = -v
             with self.lock:
                 self.axes[name] = max(-1.0, min(1.0, v))
-        elif etype == EV_KEY and code in DIGITAL_TRIGGERS:
+        elif etype == EV_KEY and code in self.triggers:
+            if value == 2:          # Linux key auto-repeat: no state change, and no release follows it
+                return None
             with self.lock:
-                self.axes[DIGITAL_TRIGGERS[code]] = 1.0 if value else 0.0
-        elif etype == EV_KEY and code in BUTTONS:
-            name = BUTTONS[code]
+                self.axes[self.triggers[code]] = 1.0 if value else 0.0
+        elif etype == EV_KEY and code in self.buttons:
+            name = self.buttons[code]
             with self.lock:
                 if value:
                     self.held.add(name)
@@ -113,9 +155,21 @@ def _find_device():
         abs_codes = {c if isinstance(c, int) else c[0] for c in caps.get(EV_ABS, [])}
         keys = set(caps.get(EV_KEY, []))
         if {0, 1} <= abs_codes and keys & {304, 305} and ({3, 4} <= abs_codes or {2, 5} <= abs_codes):
-            return d, (AXES if {3, 4} <= abs_codes else ALT_AXES)
+            return d, (AXES if {3, 4} <= abs_codes else ALT_AXES), PROFILES.get((d.info.vendor, d.info.product))
         d.close()
-    return None, None
+    return None, None, None
+
+
+def _setup(state: PadState, dev, layout, profile):
+    state.configure(layout, profile)
+    state.ranges = {}
+    for code in state.map:
+        try:
+            info = dev.absinfo(code)
+            if info.max > info.min:
+                state.ranges[code] = (info.min, info.max)
+        except Exception:  # noqa: BLE001 - axis the device doesn't have
+            pass
 
 
 class Gamepad:
@@ -128,6 +182,7 @@ class Gamepad:
         self.on_release = on_release or (lambda name: None)
         self.alive = True
         self.connected = False
+        self.name = ""
         threading.Thread(target=self._run, daemon=True).start()
 
     def stop(self):
@@ -143,7 +198,7 @@ class Gamepad:
         while self.alive:
             dev = None
             try:
-                dev, layout = _find_device()
+                dev, layout, profile = _find_device()
             except Exception as e:  # noqa: BLE001
                 msg = f"🎮 can't read controllers ({e}) - is the user in the 'input' group?"
                 if msg != last_msg:
@@ -155,16 +210,11 @@ class Gamepad:
                     self.on_status(last_msg)
                 time.sleep(2)
                 continue
-            self.state.map = dict(layout)
-            for code in layout:
-                try:
-                    info = dev.absinfo(code)
-                    self.state.ranges[code] = (info.min, info.max)
-                except Exception:  # noqa: BLE001
-                    pass
+            _setup(self.state, dev, layout, profile)
             self.state.reset()
+            self.name = dev.name
             self.connected = True
-            last_msg = f"🎮 connected: {dev.name}"
+            last_msg = f"🎮 connected: {dev.name}" + (f"  ({profile['name']} button map)" if profile else "")
             self.on_status(last_msg)
             try:
                 for ev in dev.read_loop():
@@ -202,21 +252,24 @@ def _diagnose():
             print(f"  {p}  {d.name}")
         except OSError as e:
             print(f"  {p}  (can't open: {e} - add yourself to the 'input' group and log in again)")
-    dev, layout = _find_device()
+    dev, layout, profile = _find_device()
     if dev is None:
         raise SystemExit("\nNo gamepad found. Is it plugged in / paired? If it isn't listed above at all,\n"
                          "the Pi can't see it (some phone-only controllers never show up on Linux).")
-    print(f"\nusing: {dev.name}  ({'standard' if layout is AXES else 'Z/RZ right-stick'} layout)\n"
-          "move the sticks / press buttons - Ctrl+C to quit\n")
     st = PadState()
-    st.map = dict(layout)
-    for code in layout:
-        try:
-            i = dev.absinfo(code)
-            st.ranges[code] = (i.min, i.max)
-        except Exception:  # noqa: BLE001
-            pass
+    _setup(st, dev, layout, profile)
+    print(f"\nusing: {dev.path}  {dev.name}  (id {dev.info.vendor:04x}:{dev.info.product:04x}, "
+          f"{'standard' if st.map.get(3) == 'rx' else 'Z/RZ right-stick'} layout"
+          + (f", {profile['name']} button map" if profile else "") + ")\n"
+          "move the sticks / press buttons - Ctrl+C to quit. Unknown codes are printed as RAW.\n")
     for ev in dev.read_loop():
+        known = (ev.code in st.map or (ev.code in HATS and st.hats)) if ev.type == EV_ABS else \
+            (ev.code in st.buttons or ev.code in st.triggers) if ev.type == EV_KEY else True
+        if not known:
+            what = "EV_ABS" if ev.type == EV_ABS else "EV_KEY"
+            note = "  (D-pad hat - ignored for this pad)" if ev.type == EV_ABS and ev.code in HATS else ""
+            print(f"RAW  {what} code {ev.code} value {ev.value}{note}" + " " * 40)
+            continue
         b = st.event(ev.type, ev.code, ev.value)
         if b and b.startswith("-"):
             b = None
