@@ -160,6 +160,36 @@ def drop_joint5_override(config: Path, folder: Path) -> Path | None:
 
 
 # ------------------------------------------------------------------ hardware
+ARM_PROGRAMS = r"control_gui\.py|record\.py|game\.py|0[1-5]_[a-z_]+\.py"
+
+
+def other_arm_programs() -> list[str]:
+    """Other programs that hold the serial port (Linux); they'd steal the servo replies."""
+    import os
+    import subprocess
+    try:
+        out = subprocess.run(["pgrep", "-af", ARM_PROGRAMS], capture_output=True, text=True, timeout=3).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return [ln for ln in out.splitlines() if ln.strip() and not ln.startswith(f"{os.getpid()} ")
+            and "pgrep" not in ln]
+
+
+def wait_for_servo(bus, sid: int, seconds: float = 4.0) -> bool:
+    """Read the servo's position until it answers. The first requests after opening the port
+    can be lost while the ESP32 settles; the GUI hides that by polling, so do the same."""
+    from servo_bus import ServoError    # noqa: PLC0415
+    end = time.monotonic() + seconds
+    while True:
+        try:
+            bus.read_position(sid)
+            return True
+        except (ServoError, OSError):
+            if time.monotonic() > end:
+                return False
+            time.sleep(0.2)
+
+
 def read_steady(bus, sid: int) -> int | None:
     vals = []
     for _ in range(7):
@@ -223,17 +253,35 @@ def main(argv=None, bus=None, transport=None, ask=input) -> int:
         print(f"NOTE: {Path(a.config).name} overrides the limits of joint(s) {', '.join(diff)} - "
               "roboarm uses those, not arm_settings.py")
     _show_checks("limits roboarm uses now", cfg["joint_limits"], recorded)
+    if diff:
+        _show_checks("arm_settings.py limits, without the override", off_raw, recorded)
     if a.check:
         return 0
 
+    port = "mock"
     if bus is None:
         if a.mock:
             from servo_bus import mock_bus                # noqa: PLC0415
             bus, transport = mock_bus(time_scale=50)
         else:
+            others = other_arm_programs()
+            if others:
+                print("\nClose these first - they use the arm's serial port and would steal its replies:")
+                print("\n".join("    " + o for o in others))
+                print("(close the window, or: pkill -f control_gui.py)")
+                return 1
+            from motion import find_port                  # noqa: PLC0415
+            port = find_port(cfg)
+            print(f"\nopening {port} @ {cfg['baud']} ...")
             bus = open_bus(cfg)
-    if not bus.ping(sid):
-        print(f"gripper servo {sid} isn't answering - is the arm powered and the GUI closed?")
+    if not wait_for_servo(bus, sid):
+        alive = [j for j in NAMES if j != sid and wait_for_servo(bus, j, 0.6)]
+        if alive:
+            print(f"\nservos {alive} answer on {port} but the gripper (servo {sid}) doesn't - check its cable "
+                  "(the last one in the chain) and that its ID is still 5.")
+        else:
+            print(f"\nno servo answers on {port}. Check: the arm's 12 V power is on, the ESP32 is in "
+                  "serial-forwarding mode, the USB cable is in, and no other program has the port open.")
         return 1
 
     def sim(v):                                         # --mock: pretend a hand moved the jaws

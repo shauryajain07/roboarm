@@ -214,6 +214,36 @@ class FullRun(unittest.TestCase):
                 self.assertEqual(C.main(args, bus=bus, transport=t, ask=ask), 0)
             self.assertEqual({p.name: p.read_text() for p in d.iterdir()}, before)
 
+    def test_silent_gripper_is_reported_not_crashed(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            args = self._files(d)
+            bus, t = mock_bus(time_scale=50)
+            del t.servos[5]                       # gripper not answering; 1-4 fine
+            out = io.StringIO()
+            orig = C.wait_for_servo
+            quick = lambda b, s, seconds=4.0: orig(b, s, min(seconds, 0.3))  # noqa: E731
+            with mock.patch.dict(os.environ, {"ROBOARM_OFFICIAL": str(d)}), contextlib.redirect_stdout(out), \
+                    mock.patch.object(C, "wait_for_servo", side_effect=quick):
+                self.assertEqual(C.main(args, bus=bus, transport=t, ask=hands(t)), 1)
+            self.assertIn("servos [1, 2, 3, 4] answer", out.getvalue())
+            self.assertEqual((d / "arm_settings.py").read_text(), SETTINGS)
+
+    def test_first_lost_reply_is_retried(self):
+        bus, t = mock_bus(time_scale=50)
+        real = bus.read_position
+        calls = []
+
+        def flaky(sid):
+            calls.append(sid)
+            if len(calls) == 1:
+                from servo_bus import ServoTimeout
+                raise ServoTimeout("lost while the ESP32 settles")
+            return real(sid)
+        bus.read_position = flaky
+        self.assertTrue(C.wait_for_servo(bus, 5, 2.0))
+        self.assertEqual(len(calls), 2)
+
     def test_check_only_needs_no_arm(self):
         with tempfile.TemporaryDirectory() as d:
             d = Path(d)
