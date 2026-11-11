@@ -38,6 +38,8 @@ OPEN_DEG, CLOSED_DEG = 83.0, -28.0   # course convention: closing = smaller grip
 OPEN_MARGIN_DEG = 2.0                # stop this far short of the open hard stop
 NEAR_TICKS = 12                      # ~1 deg: a recorded value this close to a limit was stopped by it
 MIN_TRAVEL = 150                     # ticks; less means the jaws didn't really move
+WIDEN_TICKS = 34                     # ~3 deg: recorded values this far past a measured end still count
+                                     # (hand measurement); further = from before the zero moved
 NAMES = {1: "base", 2: "shoulder", 3: "elbow", 4: "wrist", 5: "gripper"}
 
 
@@ -45,8 +47,10 @@ NAMES = {1: "base", 2: "shoulder", 3: "elbow", 4: "wrist", 5: "gripper"}
 def fit_gripper(open_raw: int, closed_raw: int, recorded=()) -> dict:
     """Zero, direction and limits from the two measured end points.
 
-    recorded: (label, raw) gripper values already in use - the limits are widened to cover
-    them, because playback refuses any target outside the limits."""
+    recorded: (label, raw) gripper values already in use. Ones just past a measured end widen
+    the limits (playback refuses targets outside them). Ones far past it can't be reached by
+    these jaws - they were recorded before the gripper's zero moved - so they are returned as
+    'stale' and NOT allowed: driving to them would push the jaws into the hard stop."""
     travel = abs(open_raw - closed_raw)
     if travel < MIN_TRAVEL:
         raise ValueError(f"open {open_raw} and closed {closed_raw} are only {travel} ticks apart - "
@@ -56,7 +60,9 @@ def fit_gripper(open_raw: int, closed_raw: int, recorded=()) -> dict:
     s = 1 if closed_raw > open_raw else -1          # raw direction of closing
     open_lim = open_raw + s * round(OPEN_MARGIN_DEG * TPD)
     lo_raw, hi_raw = sorted((open_lim, closed_raw))
-    widened = [(n, v) for n, v in recorded if not lo_raw <= v <= hi_raw]
+    outside = [(n, v) for n, v in recorded if not lo_raw <= v <= hi_raw]
+    widened = [(n, v) for n, v in outside if lo_raw - WIDEN_TICKS <= v <= hi_raw + WIDEN_TICKS]
+    stale = [(n, v) for n, v in outside if (n, v) not in widened]
     vals = [lo_raw, hi_raw] + [v for _, v in widened]
 
     def ang(raw):
@@ -67,7 +73,7 @@ def fit_gripper(open_raw: int, closed_raw: int, recorded=()) -> dict:
     return {"zero": zero, "direction": d, "limits": limits,
             "raw_limits": [max(0, raw_limits[0]), min(4095, raw_limits[1])],
             "open_deg": round(ang(open_raw), 1), "closed_deg": round(ang(closed_raw), 1),
-            "open_raw": open_raw, "closed_raw": closed_raw, "widened": widened}
+            "open_raw": open_raw, "closed_raw": closed_raw, "widened": widened, "stale": stale}
 
 
 def _set_entry(text: str, dict_name: str, key: str, value_src: str) -> str:
@@ -267,6 +273,15 @@ def main(argv=None, bus=None, transport=None, ask=input) -> int:
     print(f"  open now reads {cal['open_deg']:+.1f} deg, closed {cal['closed_deg']:+.1f} deg")
     for n, v in cal["widened"]:
         print(f"  (limits widened to keep {n} = {v} playable)")
+    if cal["stale"]:
+        print(f"\n⚠ {len(cal['stale'])} recorded gripper value(s) are beyond what these jaws can reach - they were "
+              "recorded before the gripper's zero moved, so they're NOT allowed (they'd push into the stop):")
+        for n, v in cal["stale"][:12]:
+            print(f"    {n} = {v}")
+        if len(cal["stale"]) > 12:
+            print(f"    ... +{len(cal['stale']) - 12} more")
+        print("  Re-record the grips on the Setup tab (open, cube, cylinder, trophy, attack). Scenarios that use "
+              "any of these values will stop with 'outside limit' until they're re-captured.")
 
     if a.mock:
         print("\n(mock run - nothing was saved)")
@@ -291,16 +306,18 @@ def main(argv=None, bus=None, transport=None, ask=input) -> int:
     if closed_grips:
         tight = max(closed_grips, key=lambda g: s_close * closed_grips[g])
         short = (closed_raw - closed_grips[tight]) * s_close
-        if short > 2 * NEAR_TICKS and ask(
-                f"\ngrip '{tight}' = {closed_grips[tight]} is the tightest grip, so the slider can't close "
-                f"past it - {short} ticks short of fully closed ({closed_raw}). Set it to {closed_raw}? [y/N] "
+        where = f"{short} ticks short of" if short > 0 else f"{-short} ticks past"
+        if abs(short) > 2 * NEAR_TICKS and ask(
+                f"\ngrip '{tight}' = {closed_grips[tight]} is the tightest grip, which caps how far the slider "
+                f"closes - it's {where} fully closed ({closed_raw}). Set it to {closed_raw}? [y/N] "
                 ).strip().lower() == "y":
             backup(Path(a.data), folder)
             data.grips[tight] = closed_raw
             data.save()
             print(f"✓ grip '{tight}' = {closed_raw}")
     opn = data.grips.get("open")
-    if opn is not None and abs(opn - cur_lim[0 if s_close > 0 else 1]) <= NEAR_TICKS:
+    if opn is not None and abs(opn - cur_lim[0 if s_close > 0 else 1]) <= NEAR_TICKS \
+            and ("grip 'open'", opn) not in cal["stale"]:
         print(f"\nTIP: grip 'open' = {opn} was recorded while the old limit stopped the jaws. To open wider "
               "when placing, re-record it on the Setup tab with the jaws fully open.")
 

@@ -60,13 +60,13 @@ def load(text):
     return ns
 
 
-def hands(t):
+def hands(t, open_raw=905, closed_raw=2380):
     """ask() that 'moves the jaws by hand' at each calibration prompt, then answers yes."""
     def ask(prompt):
         if prompt.startswith("1/2"):
-            t.hand_move({5: 905})
+            t.hand_move({5: open_raw})
         elif prompt.startswith("2/2"):
-            t.hand_move({5: 2380})
+            t.hand_move({5: closed_raw})
         return "y"
     return ask
 
@@ -87,10 +87,21 @@ class Fit(unittest.TestCase):
         self.assertLessEqual(hi, 2382)
         self.assertEqual(cal["widened"], [])
 
-    def test_recorded_values_stay_playable(self):
+    def test_recorded_values_just_past_an_end_stay_playable(self):
         cal = C.fit_gripper(905, 2380, [("grip 'attack'", 2400), ("SAFE", 1038)])
         self.assertEqual(cal["widened"], [("grip 'attack'", 2400)])
+        self.assertEqual(cal["stale"], [])
         self.assertGreaterEqual(cal["raw_limits"][1], 2400)
+
+    def test_values_from_before_the_zero_moved_are_not_allowed(self):
+        # jaws now open at 1900 and touch at 2900; the old grips were recorded at 1024..2223
+        rec = [("grip 'open'", 1024), ("grip 'cube'", 1393), ("grip 'attack'", 2223), ("near", 2920)]
+        cal = C.fit_gripper(1900, 2900, rec)
+        self.assertEqual(cal["stale"], [("grip 'open'", 1024), ("grip 'cube'", 1393)])
+        self.assertEqual(cal["widened"], [("near", 2920)])
+        lo, hi = cal["raw_limits"]
+        self.assertGreater(lo, 1900)                 # never past the open stop for a stale value
+        self.assertGreaterEqual(hi, 2920)
 
     def test_mirrored_gripper_keeps_closing_smaller(self):
         cal = C.fit_gripper(3000, 1700)
@@ -168,6 +179,24 @@ class FullRun(unittest.TestCase):
             self.assertEqual(json.loads((d / "scenario_data.json").read_text())["grips"]["attack"], 2380)
             self.assertEqual(len(list((d / "backups").iterdir())), 3)  # settings, config, data
             self.assertTrue(t.servos[5].torque)                       # gripper powered again
+
+    def test_moved_zero_frees_the_slider_and_flags_old_grips(self):
+        # the user's case: slider capped at attack = 2223, but there the jaws are open
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            args = self._files(d)
+            bus, t = mock_bus(time_scale=50)
+            out = io.StringIO()
+            with mock.patch.dict(os.environ, {"ROBOARM_OFFICIAL": str(d)}), contextlib.redirect_stdout(out):
+                rc = C.main(args, bus=bus, transport=t, ask=hands(t, 1900, 2900))
+                from motion import load_config
+                lo, hi = load_config(str(d / "arm_config.json"))["joint_limits"]["5"]
+            self.assertEqual(rc, 0, out.getvalue())
+            self.assertGreater(lo, 1900)
+            self.assertGreaterEqual(hi, 2900)
+            self.assertEqual(json.loads((d / "scenario_data.json").read_text())["grips"]["attack"], 2900)
+            self.assertIn("beyond what these jaws can reach", out.getvalue())
+            self.assertIn("grip 'open' = 1024", out.getvalue())
 
     def test_answering_no_changes_nothing(self):
         with tempfile.TemporaryDirectory() as d:
