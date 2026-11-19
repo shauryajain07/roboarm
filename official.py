@@ -58,8 +58,12 @@ class Conv:
         return (raw - self.s.ZERO_TICKS[n]) * 360.0 / (self.s.DIRECTIONS[n] * TICKS)
 
     def raw(self, sid, angle):
+        return round(self.ticks(sid, angle))
+
+    def ticks(self, sid, angle):
+        """Like raw(), unrounded (the gripper drive steps in fractions of a tick)."""
         n = self.name_of[sid]
-        return round(self.s.ZERO_TICKS[n] + self.s.DIRECTIONS[n] * angle * TICKS / 360.0)
+        return self.s.ZERO_TICKS[n] + self.s.DIRECTIONS[n] * angle * TICKS / 360.0
 
     def raw_limits(self):
         """ANGLE_LIMITS converted to raw tick ranges, clipped to 0..4095."""

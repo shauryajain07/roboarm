@@ -473,16 +473,24 @@ class App(tk.Tk):
 
     def set_goal(self, j, v):
         """Point joint j's slider at v (clamped to its limits) and queue the move."""
-        lo, hi = self._limits(j)
-        v = int(round(max(lo, min(hi, v))))
-        self.svar[j].set(v)
-        self.touched[j] = time.monotonic()
+        self.set_goals({j: v})
+
+    def set_goals(self, targets: dict):
+        """set_goal for several joints, queued together so they go out in the same packet
+        (the gripper drive moves shoulder, elbow and wrist as one)."""
+        vals = {}
+        for j, v in targets.items():
+            lo, hi = self._limits(j)
+            vals[j] = int(round(max(lo, min(hi, v))))
+            self.svar[j].set(vals[j])
+            self.touched[j] = time.monotonic()
         with self.goal_lock:
-            self.goal[j] = v
-        self.slider_owned.add(j)
-        if self.recording and j == GRIPPER:
-            self._rec_grip = v
-        self._show(j)
+            self.goal.update(vals)
+        self.slider_owned.update(vals)
+        if self.recording and GRIPPER in vals:
+            self._rec_grip = vals[GRIPPER]
+        for j in vals:
+            self._show(j)
 
     def _check_faults(self, faults):
         """Servo warning bits from the last poll. If a joint the SLIDER is driving is straining

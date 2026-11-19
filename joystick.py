@@ -10,6 +10,11 @@ where it is. Push diagonally to move both of that stick's joints at once (within
 straight it moves just one). Mouse drives one stick while the keyboard drives the other, so two joints (or
 all four) can move together. Everything goes through the slider system, so joint limits,
 E-STOP, jam back-off and grip strength still apply.
+
+Optional GRIPPER DRIVE (tick the box, or tap R2): the same sticks move the gripper tip instead
+of single joints, using inverse kinematics (kinematics.py):
+  left stick   ↔ base      ↕ forward / back (height and tilt held)
+  right stick  ↔ tilt      ↕ up / down      (reach and tilt held)
 """
 from __future__ import annotations
 
@@ -18,6 +23,7 @@ import time
 import tkinter as tk
 
 from gamepad import DEAD, Gamepad, curve, stick  # noqa: F401 - curve kept for importers
+from kinematics import IK_JOINTS, TipJog
 from poses import GRIPPER, JOINT_NAMES
 
 NEVER = float("-inf")
@@ -30,6 +36,10 @@ GRIP_SPEED = 400     # ticks/s while OPEN / CLOSE (or L1 / R1) is held
 GRIP_SQUEEZE = 20    # max ticks past the point where the jaws stopped on something
 KEYS = {"a": (1, -1), "d": (1, 1), "w": (2, 1), "s": (2, -1),
         "j": (4, -1), "l": (4, 1), "i": (3, 1), "k": (3, -1)}
+# gripper drive speeds per tick/s of "top speed": 500 -> 8 cm/s and 30 deg/s at full push
+TIP_SPEED = 0.08 / 500          # m/s
+TILT_SPEED = 30.0 / 500         # deg/s
+TIP_LABELS = {2: ("▲ forward", "back ▼"), 3: ("▲ up", "down ▼"), 4: "◀ tilt down · up ▶"}
 
 
 class Pad:
@@ -48,16 +58,26 @@ class Pad:
         c.create_oval(m - DEAD * R, m - DEAD * R, m + DEAD * R, m + DEAD * R, outline="#374151")
         c.create_line(m, 22, m, PAD - 22, fill="#374151")
         c.create_line(22, m, PAD - 22, m, fill="#374151")
-        c.create_text(m, 10, text=f"▲ {JOINT_NAMES[y_joint]}", fill="#9ca3af")
-        c.create_text(m, PAD - 10, text=f"{JOINT_NAMES[y_joint]} ▼", fill="#9ca3af")
+        self.top = c.create_text(m, 10, fill="#9ca3af")
+        self.bottom = c.create_text(m, PAD - 10, fill="#9ca3af")
         c.create_text(12, m, text="◀", fill="#9ca3af")
         c.create_text(PAD - 12, m, text="▶", fill="#9ca3af")
-        tk.Label(f, text=f"◀ {JOINT_NAMES[x_joint]} ▶", fg="#555").pack()
+        self.x_lbl = tk.Label(f, fg="#555")
+        self.x_lbl.pack()
+        self.relabel(False)
         self.knob = c.create_oval(m - KNOB, m - KNOB, m + KNOB, m + KNOB, fill="#2563eb",
                                   outline="#93c5fd", width=2)
         c.bind("<Button-1>", self._drag)
         c.bind("<B1-Motion>", self._drag)
         c.bind("<ButtonRelease-1>", self._release)
+
+    def relabel(self, tip: bool):
+        """Joint names, or what the axis does in gripper drive."""
+        y, x = self.y_joint, self.x_joint
+        up, down = TIP_LABELS[y] if tip else (f"▲ {JOINT_NAMES[y]}", f"{JOINT_NAMES[y]} ▼")
+        self.c.itemconfig(self.top, text=up)
+        self.c.itemconfig(self.bottom, text=down)
+        self.x_lbl.config(text=TIP_LABELS[x] if tip and x in TIP_LABELS else f"◀ {JOINT_NAMES[x]} ▶")
 
     def _place(self, dx, dy):
         m = PAD / 2
@@ -93,6 +113,11 @@ class DrivePanel:
         self.blocked: set[int] = set()              # refused this gesture (E-STOP / busy / recording)
         self.target: dict[int, float] = {}
         self._grip_t0 = 0.0
+        self.tip = tk.BooleanVar(value=False)       # gripper drive: sticks move the tip (IK)
+        self.jog = TipJog(app.conv) if app.conv else None
+        self._tip_rate = 0.0                         # fastest joint in the last tip step, ticks/s
+        self._tip_note = ""                          # last 'can't go further' reason logged
+        self._r2 = False
 
         self.pad_lbl = tk.Label(parent, text="🎮 looking for a controller…", font=("Arial", 11, "bold"),
                                 fg="#1d4ed8")
@@ -103,7 +128,7 @@ class DrivePanel:
         self._ticks = 0
         tk.Label(parent, text=("Controller: sticks as below · hold R1 close · hold L1 open · hold L2 precise · "
                                "A B X Y presets (hold View + button to save) · Menu ≡ or D-pad ↓ E-STOP · "
-                               "tap View or D-pad ↑ reset · L3 HOLD · R3 CAPTURE"),
+                               "tap View or D-pad ↑ reset · L3 HOLD · R3 CAPTURE · tap R2 gripper drive"),
                  fg="#555", wraplength=640, justify="left").pack(anchor="w")
         tk.Label(parent, text=("Push a stick: the further you push, the faster that joint moves. "
                                "Let go: it stops. Mouse = one stick, keyboard = the other."),
@@ -117,6 +142,8 @@ class DrivePanel:
         mid = tk.Frame(row)
         mid.grid(row=0, column=1, padx=8, sticky="n")
         right.frame.grid(row=0, column=2, padx=8)
+        self.tip_lbl = tk.Label(parent, text="", font=("Courier", 10, "bold"), fg="#1d4ed8")
+        self.tip_lbl.pack()
 
         tk.Label(mid, text="GRIPPER", font=("Arial", 11, "bold")).pack(pady=(30, 4))
         for txt, d, bg in (("CLOSE ▶◀", 1, "#fecaca"), ("OPEN ◀ ▶", -1, "#bbf7d0")):
@@ -132,6 +159,11 @@ class DrivePanel:
         tk.Scale(opts, variable=self.vmax, from_=100, to=1500, resolution=50, orient="horizontal",
                  length=240, label="top speed (ticks/s at full push)").pack(side="left", padx=6)
         tk.Checkbutton(opts, text="precise (¼ speed, or hold Shift)", variable=self.precise).pack(side="left")
+        tip_box = tk.Checkbutton(opts, text="gripper drive (IK) - or tap R2", variable=self.tip,
+                                 command=self._mode_changed)
+        tip_box.pack(side="left")
+        if self.jog is None:
+            tip_box.config(state="disabled", text="gripper drive (needs the official arm_settings.py)")
         ff = tk.Frame(parent)
         ff.pack()
         tk.Label(ff, text="reverse a stick direction:").pack(side="left")
@@ -233,6 +265,7 @@ class DrivePanel:
             self._ticks += 1
             if self._ticks % 8 == 0:                   # ~5 Hz is plenty for a readout
                 self._show_pad()
+                self._show_tip()
         finally:
             if self.app.alive:
                 self.app.after(int(TICK_S * 1000), self._tick)
@@ -261,7 +294,9 @@ class DrivePanel:
             fg = "#555"
         self.pad_live.config(text=txt, fg=fg)
 
-    def _speeds(self) -> dict[int, float]:
+    def _speeds(self, tip: bool = False) -> dict[int, float]:
+        """Stick + key + controller speed (-1..1) per axis, keyed by the joint it drives in joint
+        mode. In gripper drive 2 / 3 / 4 mean forward / up / tilt, which the flips don't touch."""
         vel: dict[int, float] = {}
 
         def add(j, v):
@@ -282,7 +317,8 @@ class DrivePanel:
             add(jy, vy)
         out = {}
         for j, v in vel.items():
-            v = max(-1.0, min(1.0, v)) * (-1 if self.flip[j].get() else 1)
+            flip = self.flip[j].get() and not (tip and j in IK_JOINTS)
+            v = max(-1.0, min(1.0, v)) * (-1 if flip else 1)
             if v:
                 out[j] = v
         return out
@@ -290,9 +326,19 @@ class DrivePanel:
     def _step(self):
         app = self.app
         axes, pad_held = self.pad.state.snapshot()
+        r2 = axes.get("r2", 0.0) > 0.5                 # tap R2 = gripper drive on / off
+        if r2 and not self._r2 and self.jog is not None:
+            self.tip.set(not self.tip.get())
+            self._mode_changed()
+        self._r2 = r2
         slow = self.precise.get() or self.shift or axes["l2"] > 0.4      # hold L2 = precision
         scale = self.vmax.get() * (0.25 if slow else 1.0)
-        moving = {j: v * scale for j, v in self._speeds().items()}
+        tip_mode = self.tip.get() and self.jog is not None
+        speeds = self._speeds(tip_mode)
+        tip = {j: speeds.pop(j) for j in IK_JOINTS if j in speeds} if tip_mode else {}
+        moving = {j: v * scale for j, v in speeds.items()}
+        if tip:
+            moving.update(dict.fromkeys(IK_JOINTS, 0.0))  # the tip moves joints 2-4 together
         # gripper: hold R1 = close step by step, hold L1 = open; let go = stop
         grip = self.grip_dir or (("r1" in pad_held) - ("l1" in pad_held))
         if grip:
@@ -309,16 +355,22 @@ class DrivePanel:
                 del moving[j]
             elif j not in self.active and not app._can_slide(j):   # logs why, once per push
                 self.blocked.add(j)
+                if tip and j in IK_JOINTS:
+                    self.blocked.update(IK_JOINTS)
                 del moving[j]
+        if tip and not all(j in moving for j in IK_JOINTS):
+            for j in IK_JOINTS:
+                moving.pop(j, None)
+            tip = {}
 
         stopped = self.active - set(moving)
+        speed = scale if moving else 0
+        if tip:
+            speed = max(speed, self._tip_step(tip, scale))
         for j, v in moving.items():
-            if j in self.target:
-                base = self.target[j]
-            else:
-                recent = time.monotonic() - app.touched.get(j, NEVER) <= 1.5
-                base = app.svar[j].get() if recent or j not in app.pos else app.pos[j]
-            t = base + v * TICK_S
+            if tip and j in IK_JOINTS:
+                continue
+            t = self._base(j) + v * TICK_S
             if j in app.pos:                           # never run far ahead of the real arm
                 # the reading can be ~0.3 s old: allow for how far the arm has moved since,
                 # otherwise a fast push gets throttled and feels laggy
@@ -338,11 +390,78 @@ class DrivePanel:
             t = max(lo, min(hi, t))
             self.target[j] = t
             app.set_goal(j, t)
-        app._joy_speed = scale if moving else 0
+        app._joy_speed = speed
         self.active = set(moving)
         last = {j: self.target.pop(j, None) for j in stopped}
         if stopped:
             self._stop_at_actual(stopped, last)
+
+    def _base(self, j):
+        """Where joint j is heading: its stick target, a slider you just moved, or the arm."""
+        app = self.app
+        if j in self.target:
+            return self.target[j]
+        recent = time.monotonic() - app.touched.get(j, NEVER) <= 1.5
+        return app.svar[j].get() if recent or j not in app.pos else app.pos[j]
+
+    def _tip_step(self, tip: dict[int, float], scale: float) -> float:
+        """Gripper drive: move the tip forward / up / tilt by this tick's share and point joints
+        2-4 at the inverse kinematics answer. Returns the fastest joint's speed, ticks/s."""
+        app, jog = self.app, self.jog
+        if jog.goal is None or not set(IK_JOINTS) <= self.active:   # new push: start from the arm
+            jog.start({j: self._base(j) for j in IK_JOINTS})
+            self._tip_rate = 0.0
+        if all(j in app.pos and j in self.target for j in IK_JOINTS):
+            # never run far ahead of the real arm (its reading can be ~0.3 s old): wait for it
+            age = min(1.0, time.monotonic() - app.pos_t)
+            lead = max(80.0, self._tip_rate * (0.25 + age))
+            if any(abs(self.target[j] - app.pos[j]) > lead for j in IK_JOINTS):
+                return self._tip_rate
+        lin, tilt = scale * TIP_SPEED * TICK_S, scale * TILT_SPEED * TICK_S
+        max_step = max(400.0, 2.0 * scale) * TICK_S
+        before = {j: self.target.get(j, self._base(j)) for j in IK_JOINTS}
+        raw = jog.step(tip.get(2, 0.0) * lin, tip.get(3, 0.0) * lin, tip.get(4, 0.0) * tilt,
+                       {j: app._limits(j) for j in IK_JOINTS}, max_step)
+        if raw is None:                               # edge of reach / a joint limit: hold here
+            if jog.note != self._tip_note:
+                app.log(f"gripper drive: {jog.note}")
+                self._tip_note = jog.note
+            for j in IK_JOINTS:
+                self.target.setdefault(j, before[j])
+            self._tip_rate = 0.0
+            return 0.0
+        self._tip_note = ""
+        self._tip_rate = max(abs(raw[j] - before[j]) for j in IK_JOINTS) / TICK_S
+        self.target.update(raw)
+        app.set_goals(raw)                            # one packet: the joints move as one
+        return self._tip_rate
+
+    def _mode_changed(self):
+        """Joints <-> gripper drive: stop whatever is moving, relabel the sticks."""
+        on = self.tip.get() and self.jog is not None
+        if self.active:
+            last = {j: self.target.pop(j, None) for j in self.active}
+            self._stop_at_actual(set(self.active), last)
+        self.active, self.blocked = set(), set()
+        self.target.clear()
+        if self.jog is not None:
+            self.jog.reset()
+        for p in self.pads:
+            p.relabel(on)
+        self.tip_lbl.config(text="")
+        self.app.log("🎮 gripper drive ON - sticks move the gripper tip" if on
+                     else "🎮 joint drive - sticks move single joints")
+
+    def _show_tip(self):
+        if not (self.tip.get() and self.jog is not None):
+            return
+        pos = self.app.pos
+        if not all(j in pos for j in IK_JOINTS):
+            self.tip_lbl.config(text="gripper tip: (no arm reading yet)")
+            return
+        p = self.jog.pose_of(pos)
+        self.tip_lbl.config(text=f"gripper tip: {p.reach * 100:5.1f} cm forward · {p.height * 100:5.1f} cm up"
+                                 f" · tilt {p.pitch:+5.1f}° (0 = level)")
 
     def _stop_at_actual(self, joints, last=None):
         """Let go = stop where the joint IS (not where the target had run ahead to). The

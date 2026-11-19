@@ -30,7 +30,7 @@ This assumes the workshop setup is already done: `~/robot-arm-lab/.venv` exists 
 sudo apt install -y python3-tk
 source ~/robot-arm-lab/.venv/bin/activate
 cd ~/robot-arm-lab && gh repo clone shauryajain07/roboarm
-cd roboarm && python -m unittest discover -s tests     # 24 tests on a simulated arm
+cd roboarm && python -m unittest discover -s tests     # tests on a simulated arm
 python control_gui.py --mock                            # practise with no arm
 python control_gui.py                                   # real arm
 ```
@@ -52,6 +52,19 @@ Only the gripper's torque is released. It writes the gripper's `ZERO_TICKS`, `DI
 
 Plug in or pair a controller and it shows up on the **4 Drive** tab. Its status line shows live stick values. If they don't change when you move the sticks, run `python gamepad.py` to see what the Pi receives. The SCUF NOMAD has its own button map. Use Menu ≡ for E-STOP and tap View to reset; its D-pad isn't used, because Linux misreads it.
 
+#### Gripper drive (optional)
+
+By default each stick direction turns one joint. Tick **gripper drive (IK)** on the Drive tab, or tap **R2**, and the sticks move the gripper tip instead. Inverse kinematics works out the shoulder, elbow and wrist angles for you.
+
+| Stick | ↕ | ↔ |
+|---|---|---|
+| Left | forward / back, keeping height and tilt | base (as before) |
+| Right | up / down, keeping reach and tilt | tilt the gripper |
+
+The keyboard keys, the on-screen pads, L2/Shift precise mode, the gripper buttons, E-STOP and the joint limits all work the same. A line under the pads shows where the tip is: distance forward, height and tilt (0° = level). At the edge of the arm's reach, or when a joint hits its limit, the tip stops and the log says why. Tap R2 again to go back to single joints.
+
+The geometry comes from the course's arm model (`robot-arm-simulation`), and the joint angles come from the official `arm_settings.py`. If the arm's zero positions are off, straight lines bend slightly, but a held tilt stays exact. Scenario recording and playback don't use it: they still replay your taught poses.
+
 ## Files
 
 | File | Contents |
@@ -64,6 +77,7 @@ Plug in or pair a controller and it shows up on the **4 Drive** tab. Its status 
 | `official.py` | Reads the official `arm_settings.py`, converts between raw ticks and angles, and writes waypoint files |
 | `calibrate.py` | Gripper calibration (writes the official `arm_settings.py`) and a check of every joint's limits |
 | `gamepad.py`, `joystick.py` | Game controller reader with per-pad button maps, and the **4 Drive** tab |
+| `kinematics.py` | Arm geometry and inverse kinematics for the Drive tab's optional gripper drive |
 | `motion.py` | Synchronised moves (all joints arrive together), joint limits, E-stop and grip detection |
 | `servo_bus.py` | The ST3215 serial driver (same bytes as the course tools), plus a simulated arm |
 | `strategy.py` | Suggests a placement (win, block, then the best open line) or an attack target |
